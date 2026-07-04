@@ -163,7 +163,7 @@ public class MainActivity extends AppCompatActivity {
         String model = configStore.getModel();
         tvStatus.setText("API Key: " + (hasKey ? "已配置" : "未配置")
                 + "\nModel: " + model
-                + "\nService: " + (BackgroundAssistService.isRunning ? "运行中" : "未启动"));
+                + "\nService: " + (BackgroundAssistService.isRunning() ? "运行中" : "未启动"));
     }
 
     @NonNull
