@@ -117,15 +117,18 @@ public class BackgroundAssistService extends Service {
             new java.io.File("/data/data/com.xq.xxt.ai/cache/aixxt-debug.log");
 
     private static synchronized void debugLog(@NonNull String tag, @NonNull String msg) {
+        // 同时写到 logcat，便于即使 cache 目录写不进去也能看到
+        Log.i("AiXxtDbg", "[" + tag + "] " + msg);
         try {
             String line = "[" + new java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US)
                     .format(new java.util.Date()) + "] [" + tag + "] " + msg + "\n";
             try (java.io.FileWriter fw = new java.io.FileWriter(DEBUG_LOG_FILE, true);
                  java.io.BufferedWriter bw = new java.io.BufferedWriter(fw)) {
                 bw.write(line);
+                bw.flush();
             }
-        } catch (Throwable ignored) {
-            // 调试日志写失败不能影响主流程
+        } catch (Throwable t) {
+            Log.w("AiXxtDbg", "debugLog file write failed: " + t.getClass().getSimpleName() + ": " + t.getMessage());
         }
     }
 
@@ -494,11 +497,10 @@ public class BackgroundAssistService extends Service {
 
     private void presentAnswer(@NonNull String answer) {
         String trimmed = answer.trim();
-        if (trimmed.length() <= SHORT_ANSWER_THRESHOLD && !trimmed.contains("\n")) {
-            RootCmdExecutor.get().systemToastAsync("AI答案: " + trimmed, null);
-        } else {
-            showLongAnswer(trimmed);
-        }
+        // v4 修复：所有答案统一走 Notification，废弃 am broadcast Toast（ColorOS 14+ 会立刻 Toast already killed）
+        showLongAnswer(trimmed);
+        // 短答案额外在 logcat 输出一份，便于自动化测试 / 排查
+        Log.i(TAG, "AI ANSWER: " + trimmed);
     }
 
     private void showLongAnswer(@NonNull String text) {
