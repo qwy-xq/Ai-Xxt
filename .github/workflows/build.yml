@@ -69,6 +69,17 @@ jobs:
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 14
+          # compression-level: 0 — store without compression so the
+          # inner APK's local file headers are preserved byte-for-byte.
+          # (compressed zip containers were observed to corrupt the
+          # APK's central directory on download via PowerShell.)
+          compression-level: 0
+
+      - name: Dump APK SHA256 to log
+        run: |
+          sha256sum app/build/outputs/apk/debug/*.apk
+          echo "ARTIFACT_PATH=app/build/outputs/apk/debug/app-debug.apk"
+          echo "ARTIFACT_SIZE=$(stat -c%s app/build/outputs/apk/debug/app-debug.apk)"
 
       - name: Upload build report on failure
         if: failure()
