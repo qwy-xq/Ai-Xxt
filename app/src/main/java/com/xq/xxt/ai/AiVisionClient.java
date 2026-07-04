@@ -17,7 +17,6 @@ import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 
 import okhttp3.Call;
-import okhttp3.Callback;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -26,38 +25,57 @@ import okhttp3.Response;
 
 /**
  * AI Vision 客户端 —— 把本地截图丢给 OpenAI 兼容 Chat Completions 接口。
- * <p>
- * <b>本次重写强调的健壮性点：</b>
+ *
+ * <p><b>本次重写对齐主理人 v2 契约：</b></p>
  * <ol>
- *   <li><b>Base64 死穴</b>：{@link #encodeFileToBase64} / {@link #encodeFileToDataUrl}
- *       显式使用 {@link Base64#NO_WRAP}。{@code Base64.DEFAULT} 会每 76 个字符插一个 {@code \n}，
- *       直接塞进 JSON image_url 会破坏字符串，导致上游 HTTP 400；</li>
- *   <li><b>多线程死穴</b>：OkHttp {@code enqueue} 回调在子线程。本类只负责把
- *       {@link ResultCallback} 透传给上游，<b>不在子线程做 Toast/Notification/UI</b>。
- *       业务侧应在 {@code onSuccess} / {@code onFailure} 里自行切回主线程；</li>
- *   <li><b>JSON 健壮性</b>：构造标准 OpenAI Chat Completions body；解析
- *       {@code choices[0].message.content} 时，兼容两种中转站常见格式：
- *       <ul>
- *         <li>{@code content} 是 {@code String}（最常见）</li>
- *         <li>{@code content} 是 {@code [{type:"text", text:"..."}, ...]} 数组
- *             （部分 OpenAI 兼容网关 / 多模态输出格式）</li>
- *       </ul>
- *       解析失败 / 字段缺失 / content 空串都会走 {@code onFailure} 并
- *       {@code Log.e} 带原始响应前 500 字，绝不让整条线程死。</li>
- *   <li><b>无第三方依赖</b>：仅用 OkHttp + org.json（Android SDK 自带）。</li>
+ *   <li>顶层入口是 {@link #analyze(File, Callback)} —— 接收一个本地图片文件和
+ *       一个 {@link Callback}，把 Vision 模型的最终文本答案回传；</li>
+ *   <li>API key / baseUrl / model 来源优先级：
+ *       <ol>
+ *         <li>{@link #setConfig(String, String, String)} 注入的最新值（最高优先）；</li>
+ *         <li>{@link #init(Context)} 后从 {@link ConfigStore} 读（每次重新读取，避免缓存）；</li>
+ *         <li>实在没有时用占位常量（详见 {@link #PLACEHOLDER_API_KEY} / {@link #PLACEHOLDER_BASE_URL} /
+ *             {@link #PLACEHOLDER_MODEL}）—— <b>占位常量仅用于"未配置时让链路不挂"</b>，
+ *             实际请求会被上游 HTTP 401 拒掉，走 {@code onFailure}。</li>
+ *       </ol>
+ *   </li>
+ *   <li>JSON 解析 try-catch 包死：任何 {@link JSONException} / {@link NullPointerException} /
+ *       {@link IndexOutOfBoundsException} 都视为"无答案"，走 {@code onFailure}，<b>不让整条线程死</b>；</li>
+ *   <li>Base64 <b>必须</b>用 {@link Base64#NO_WRAP} —— {@code Base64.DEFAULT} 每 76 字符塞一个 {@code \n}，
+ *       拼到 JSON 字符串里会撑爆字段，触发 HTTP 400（这是 v1 死穴，已修）；</li>
+ *   <li>本地 IO 用纯 JDK 的 {@link FileInputStream}，不碰 {@code java.nio.file.Files}，
+ *       后者是 Android API 26+ 才有，与本项目 {@code minSdk=24} 不兼容（这是 v1 死穴，已修）。</li>
  * </ol>
- * <p>
- * 配置（apiKey / baseUrl / model）由 {@link ConfigStore} 持有，每次调用都
- * 重新读取 —— 用户在 MainActivity 改了保存，下一次请求立刻生效。
+ *
+ * <p><b>线程模型：</b>本类的 {@link Callback#onSuccess(String)} / {@link Callback#onFailure(Throwable)}
+ * 都在 {@code root-exec-io} / OkHttp dispatcher 线程 —— <b>严禁</b>在 callback 里直接
+ * {@code Toast} / {@code NotificationManager}。业务侧应在 callback 内
+ * {@code new android.os.Handler(android.os.Looper.getMainLooper()).post(...)} 切回主线程。</p>
  */
 public final class AiVisionClient {
 
     private static final String TAG = "AiVisionClient";
 
+    // ------------------------------------------------------------
+    // 占位常量 —— 仅用于"没配置时让链路不挂"，请求一定会被上游 401 拒掉
+    // ------------------------------------------------------------
+
+    /**
+     * 占位 API Key。注释清楚是占位：未配置时用这个值发请求，OpenAI 必然返回 401，
+     * 然后 {@link Callback#onFailure} 会被调用，业务侧能拿到错误。
+     */
+    static final String PLACEHOLDER_API_KEY = "sk-PLACEHOLDER-CONFIGURE-IN-MAIN-ACTIVITY";
+
+    /** 占位 Base URL —— 指向 OpenAI 官方。占位模式下请求同样会 401。 */
+    static final String PLACEHOLDER_BASE_URL = "https://api.openai.com";
+
+    /** 占位 Model。 */
+    static final String PLACEHOLDER_MODEL = "gpt-4o-mini";
+
     private static volatile AiVisionClient INSTANCE;
 
     /**
-     * 在 Application.onCreate（或 MainActivity onCreate）里调用一次，注入 Context。
+     * 在 Application.onCreate（或 MainActivity / Service onCreate）里调用一次，注入 Context。
      * 之后 {@link #get()} 拿到的实例就能用 {@link ConfigStore} 读最新配置。
      */
     public static synchronized void init(@NonNull Context ctx) {
@@ -68,7 +86,7 @@ public final class AiVisionClient {
                 }
             }
         } else {
-            // 允许热替换 ConfigStore（比如测试场景），一般不需要
+            // 允许热替换 ConfigStore
             INSTANCE.configStore = new ConfigStore(ctx);
         }
     }
@@ -84,9 +102,9 @@ public final class AiVisionClient {
 
     /**
      * OkHttp 单例 —— 复用连接池，避免每次请求重建。
-     * 超时配置：connect 15s / read 60s / write 30s。
-     * 为什么 read 给 60s：Vision 模型推理 1k token 偶尔要 20~40s，read 太短
-     * 会在响应还没读完时断流。
+     * <p>超时：connect 15s / read 60s / write 30s。
+     * read 给 60s 是因为 Vision 模型推理 1k token 偶尔要 20~40s，
+     * read 太短会在响应还没读完时断流。</p>
      */
     private final OkHttpClient http = new OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
@@ -97,71 +115,151 @@ public final class AiVisionClient {
 
     private volatile ConfigStore configStore;
 
+    /** 三元组覆盖（apiKey/baseUrl/model 任意一项非 null 即覆盖 ConfigStore 里的同名字段） */
+    @Nullable private volatile String overrideApiKey;
+    @Nullable private volatile String overrideBaseUrl;
+    @Nullable private volatile String overrideModel;
+
     private AiVisionClient(@NonNull ConfigStore store) {
         this.configStore = store;
     }
 
-    // ------------------------------------------------------------
-    // 公共 API
-    // ------------------------------------------------------------
+    // ============================================================
+    // 公共 API（主理人 v2 契约）
+    // ============================================================
 
     /**
-     * 异步提交一张截图给 Vision 模型。
-     * <p>
-     * 每次调用都会从 {@link ConfigStore} 重新读取 apiKey / baseUrl / model。
-     * <p>
-     * <b>线程模型：</b>准备阶段（读盘 + 编码）会启动一个 {@code vision-prepare}
-     * 线程；OkHttp {@code enqueue} 之后回调也在子线程。{@code cb} 的
-     * {@code onSuccess} / {@code onFailure} 都在子线程，调用方需要自行
-     * {@code new Handler(Looper.getMainLooper()).post(...)} 切到主线程做 UI。
-     *
-     * @param imagePath 本地图片绝对路径（通常为 app 私有 cache 下的 screenshot.png）
-     * @param prompt    发送给模型的文本提示
-     * @param cb        结果回调；可以为空
+     * 注入最新配置；任意参数为 null 表示该字段继续走 ConfigStore / 占位。
+     * <p>MainActivity 保存配置后立即调一次本方法，下一次 {@link #analyze} 立刻生效。</p>
      */
-    public void sendImageAsync(@NonNull String imagePath,
-                               @NonNull String prompt,
-                               @Nullable ResultCallback cb) {
-        new Thread(() -> {
-            try {
-                String apiKey = configStore.getApiKey();
-                String baseUrl = configStore.getBaseUrl();
-                String model = configStore.getModel();
+    public void setConfig(@Nullable String apiKey, @Nullable String baseUrl, @Nullable String model) {
+        this.overrideApiKey = apiKey;
+        this.overrideBaseUrl = baseUrl;
+        this.overrideModel = model;
+    }
 
-                if (apiKey == null || apiKey.isEmpty()) {
-                    deliverFailure(cb, new IllegalStateException(
+    /**
+     * <b>主入口。</b>异步分析一张本地截图，把模型的最终文本答案回传给 {@code cb}。
+     * <p>典型用法：</p>
+     * <pre>
+     *   File png = RootCmdExecutor.screenshot(ctx);
+     *   AiVisionClient.get().analyze(png, new AiVisionClient.Callback() {
+     *       public void onSuccess(String answer) { ... }
+     *       public void onFailure(Throwable t)  { ... }
+     *   });
+     * </pre>
+     *
+     * <p>callback 都在后台线程触发，调用方需自行切主线程做 UI。</p>
+     *
+     * @param png 本地图片文件（PNG）。<b>不能为空、必须 exists()、可读。</b>
+     * @param cb  结果回调；可以为空。任一异常路径都走 onFailure，绝不抛
+     */
+    public void analyze(@NonNull File png, @Nullable Callback cb) {
+        if (png == null || !png.exists() || !png.isFile()) {
+            invokeFailure(cb, new IOException("screenshot file not found: " + png));
+            return;
+        }
+        // 读盘 + Base64 编码在 background 线程做，IO 完了再走 OkHttp（OkHttp 自己在 dispatcher 线程）
+        ioExec.execute(() -> {
+            try {
+                String apiKey = effectiveApiKey();
+                String baseUrl = effectiveBaseUrl();
+                String model = effectiveModel();
+
+                if (apiKey.isEmpty()) {
+                    invokeFailure(cb, new IllegalStateException(
                             "apiKey is empty; please configure it in MainActivity first"));
                     return;
                 }
-                if (baseUrl == null || baseUrl.isEmpty()) {
-                    deliverFailure(cb, new IllegalStateException("baseUrl is empty"));
+                if (baseUrl.isEmpty()) {
+                    invokeFailure(cb, new IllegalStateException("baseUrl is empty"));
                     return;
                 }
-                if (model == null || model.isEmpty()) {
-                    deliverFailure(cb, new IllegalStateException("model is empty"));
+                if (model.isEmpty()) {
+                    invokeFailure(cb, new IllegalStateException("model is empty"));
                     return;
                 }
 
-                String b64 = encodeFileToBase64(imagePath);
-                String body = buildRequestBody(b64, prompt, model);
+                // 关键：NO_WRAP 必填
+                String b64 = encodeFileToBase64(png.getAbsolutePath());
+                String body = buildRequestBody(b64, DEFAULT_PROMPT, model);
                 doRequest(baseUrl, apiKey, body, cb);
             } catch (Throwable t) {
-                Log.e(TAG, "sendImageAsync prepare failed", t);
-                deliverFailure(cb, t);
+                // 任何异常（IO / JSON / NPE）都吞下走 onFailure，不让线程死
+                Log.e(TAG, "analyze failed", t);
+                invokeFailure(cb, t);
             }
-        }, "vision-prepare").start();
+        });
     }
+
+    /**
+     * 默认提示词 —— 跟 BackgroundAssistService 里的语义一致。
+     */
+    public static final String DEFAULT_PROMPT =
+            "你是一个屏幕内容助手。请仔细查看这张截图，"
+                    + "如果里面是选择题或判断题，只输出最终答案（字母或 True/False），不要解释；"
+                    + "如果是问答题，给出简洁、可直接抄写的答案；"
+                    + "如果没有可回答的内容，回复 'NO_QUESTION'。";
+
+    /**
+     * 单线程 Executor —— 专门跑"读盘 + Base64 编码"准备阶段。
+     * 跟 RootCmdExecutor 共享一个池意义不大，分开管理更清晰。
+     */
+    private final java.util.concurrent.ExecutorService ioExec =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "vision-prepare");
+                t.setDaemon(true);
+                return t;
+            });
+
+    // ============================================================
+    // 配置解析（override > ConfigStore > 占位）
+    // ============================================================
+
+    @NonNull
+    private String effectiveApiKey() {
+        if (overrideApiKey != null && !overrideApiKey.isEmpty()) return overrideApiKey.trim();
+        if (configStore != null) {
+            String v = configStore.getApiKey();
+            if (!v.isEmpty()) return v;
+        }
+        return PLACEHOLDER_API_KEY;
+    }
+
+    @NonNull
+    private String effectiveBaseUrl() {
+        if (overrideBaseUrl != null && !overrideBaseUrl.isEmpty()) return overrideBaseUrl.trim();
+        if (configStore != null) {
+            String v = configStore.getBaseUrl();
+            if (!v.isEmpty()) return v;
+        }
+        return PLACEHOLDER_BASE_URL;
+    }
+
+    @NonNull
+    private String effectiveModel() {
+        if (overrideModel != null && !overrideModel.isEmpty()) return overrideModel.trim();
+        if (configStore != null) {
+            String v = configStore.getModel();
+            if (!v.isEmpty()) return v;
+        }
+        return PLACEHOLDER_MODEL;
+    }
+
+    // ============================================================
+    // Base64 + IO（API 24 兼容）
+    // ============================================================
 
     /**
      * 把本地文件编码为 OpenAI image_url 所需的 data url 形式
      * （{@code data:image/png;base64,xxxx}）。
-     * <p><b>关键：</b>使用 {@link Base64#NO_WRAP}，避免 76 字符换行污染 JSON。
+     * <p><b>关键：</b>使用 {@link Base64#NO_WRAP}，避免 76 字符换行污染 JSON。</p>
      * <p><b>兼容性：</b>此处<b>不用</b> {@code java.nio.file.Files.readAllBytes} 之类
      * NIO.2 工具方法 —— 它们是 Android API 26 (Oreo) 才引入的，与本项目
      * {@code minSdk=24}（Android 7.0/7.1）不兼容，在低版本系统上会
      * {@code NoClassDefFoundError} 整条 Vision 链路直接挂掉。改用
      * {@link FileInputStream} + try-with-resources 手动读完字节数组，
-     * 是 Android 1.0 时代就有的稳定 API，所有 API level 都能跑。
+     * 是 Android 1.0 时代就有的稳定 API，所有 API level 都能跑。</p>
      */
     @NonNull
     public static String encodeFileToDataUrl(@NonNull String path) throws IOException {
@@ -172,7 +270,6 @@ public final class AiVisionClient {
 
     /**
      * 仅返回裸 base64 字符串。同样用 {@link Base64#NO_WRAP}。
-     * <p>同样走 {@link #readAllBytesCompat}，避免 {@code java.nio.file} 在低 API 上挂掉。
      */
     @NonNull
     public static String encodeFileToBase64(@NonNull String path) throws IOException {
@@ -184,36 +281,35 @@ public final class AiVisionClient {
      * 兼容 Android 7.0/7.1 (API 24/25) 的"把文件读到 byte[]"实现。
      * <p>不能调用 {@code java.nio.file.Files.readAllBytes}，那是 API 26+；
      * 这里用最朴素的 {@link FileInputStream} 循环 read，直到读满 {@code f.length()}
-     * 或遇 EOF（提前 EOF 视为 IOException，由调用方走 onFailure 路径）。
-     * <p>try-with-resources 保证 fd 不泄漏；异常全部上抛，不在内部吞。
+     * 或遇 EOF（提前 EOF 视为 IOException，由调用方走 onFailure 路径）。</p>
+     * <p>try-with-resources 保证 fd 不泄漏；异常全部上抛，不在内部吞。</p>
      */
     @NonNull
     private static byte[] readAllBytesCompat(@NonNull String path) throws IOException {
         File f = new File(path);
-        // 防御：length() == 0 时分配 0 长度数组也合法，但几乎一定是文件被截断/并发删除
         byte[] bytes = new byte[(int) f.length()];
         try (FileInputStream fis = new FileInputStream(f)) {
             int read = 0;
             while (read < bytes.length) {
                 int n = fis.read(bytes, read, bytes.length - read);
                 if (n < 0) {
-                    // 文件大小在两次调用之间被改小（被并发 chmod/chmod 后被另一进程截断等），
+                    // 文件大小在两次调用之间被改小（被并发 truncate 等），
                     // 视为 IO 失败，不静默处理
                     throw new IOException("unexpected EOF at " + read + "/" + bytes.length + ": " + path);
-                }
+            }
                 read += n;
             }
             return bytes;
         }
     }
 
-    // ------------------------------------------------------------
-    // 内部
-    // ------------------------------------------------------------
+    // ============================================================
+    // HTTP 请求 / 响应解析
+    // ============================================================
 
     /**
      * 构造标准 OpenAI Chat Completions 请求体。
-     * <p>结构：
+     * <p>结构：</p>
      * <pre>
      * {
      *   "model": "&lt;model&gt;",
@@ -229,7 +325,6 @@ public final class AiVisionClient {
      *   "max_tokens": 1024
      * }
      * </pre>
-     * 用 org.json 而不是 Gson —— Android SDK 自带，避免引入第三方包。
      */
     @NonNull
     private String buildRequestBody(@NonNull String base64Image,
@@ -264,13 +359,13 @@ public final class AiVisionClient {
     }
 
     /**
-     * 实际发请求。OkHttp 回调在子线程 —— 我们只透传 Result / Throwable，
+     * 实际发请求。OkHttp 回调在子线程 —— 我们只透传 String / Throwable，
      * UI 由调用方自己切主线程处理。
      */
     private void doRequest(@NonNull String baseUrl,
                            @NonNull String apiKey,
                            @NonNull String body,
-                           @Nullable ResultCallback cb) {
+                           @Nullable Callback cb) {
         // 兼容 baseUrl 末尾带不带 "/"
         String url = baseUrl.endsWith("/")
                 ? baseUrl + "v1/chat/completions"
@@ -283,11 +378,11 @@ public final class AiVisionClient {
                 .post(RequestBody.create(body, MediaType.parse("application/json; charset=utf-8")))
                 .build();
 
-        http.newCall(req).enqueue(new Callback() {
+        http.newCall(req).enqueue(new okhttp3.Callback() {
             @Override
             public void onFailure(@NonNull Call call, @NonNull IOException e) {
                 Log.w(TAG, "network failure: " + e.getMessage());
-                deliverFailure(cb, e);
+                invokeFailure(cb, e);
             }
 
             @Override
@@ -295,41 +390,24 @@ public final class AiVisionClient {
                 try (Response r = response) {
                     String respBody = r.body() != null ? r.body().string() : "";
                     if (!r.isSuccessful()) {
-                        // HTTP 非 2xx 整体当作失败。截取前 500 字 dump 出来，
-                        // 方便排查（大部分中转站错误信息是 JSON，但 body 可能很大）
-                        String snippet = respBody == null ? "" : respBody;
-                        if (snippet.length() > 500) snippet = snippet.substring(0, 500) + "…";
+                        String snippet = snippetOf(respBody);
                         String msg = "http " + r.code() + ": " + snippet;
                         Log.w(TAG, msg);
-                        deliverFailure(cb, new IOException(msg));
+                        invokeFailure(cb, new IOException(msg));
                         return;
                     }
                     String content = extractMessageContent(respBody);
-                    if (content == null) {
-                        // 解析失败 / 字段缺失 / content 为空 —— 都视为失败
-                        String snippet = respBody == null ? "" : respBody;
-                        if (snippet.length() > 500) snippet = snippet.substring(0, 500) + "…";
-                        Log.e(TAG, "extractMessageContent returned null. raw(<=500)=" + snippet);
-                        deliverFailure(cb, new IOException("empty content in response: " + snippet));
+                    if (content == null || content.isEmpty()) {
+                        String snippet = snippetOf(respBody);
+                        Log.e(TAG, "empty content. raw(<=500)=" + snippet);
+                        invokeFailure(cb, new IOException("empty content in response: " + snippet));
                         return;
                     }
-                    if (content.isEmpty()) {
-                        String snippet = respBody == null ? "" : respBody;
-                        if (snippet.length() > 500) snippet = snippet.substring(0, 500) + "…";
-                        Log.e(TAG, "content is empty string. raw(<=500)=" + snippet);
-                        deliverFailure(cb, new IOException("content is empty: " + snippet));
-                        return;
-                    }
-                    if (cb != null) {
-                        try {
-                            cb.onSuccess(new Result(content, respBody));
-                        } catch (Throwable inner) {
-                            Log.e(TAG, "callback.onSuccess threw", inner);
-                        }
-                    }
+                    invokeSuccess(cb, content);
                 } catch (Throwable t) {
+                    // 任何 JSONException / NPE / IO 都在这里兜住
                     Log.e(TAG, "parse response failed", t);
-                    deliverFailure(cb, t);
+                    invokeFailure(cb, t);
                 }
             }
         });
@@ -337,7 +415,7 @@ public final class AiVisionClient {
 
     /**
      * 从 OpenAI 兼容响应里抠出 {@code choices[0].message.content} 文本。
-     * <p>兼容 content 的两种形态：
+     * <p>兼容 content 的两种形态：</p>
      * <ul>
      *   <li>String —— 直接返回；</li>
      *   <li>JSONArray —— 遍历 type=="text" 的 part，把 text 拼起来。</li>
@@ -358,9 +436,11 @@ public final class AiVisionClient {
                 Log.w(TAG, "choices is null or empty");
                 return null;
             }
-            JSONObject first = choices.optJSONObject(0);
-            if (first == null) {
-                Log.w(TAG, "choices[0] is not an object");
+            JSONObject first;
+            try {
+                first = choices.getJSONObject(0);
+            } catch (JSONException | IndexOutOfBoundsException e) {
+                Log.w(TAG, "choices[0] not object: " + e.getMessage());
                 return null;
             }
             // 兼容部分老式 / 类补全接口：直接在 choice 上有 text 字段
@@ -407,16 +487,28 @@ public final class AiVisionClient {
             Log.w(TAG, "extractMessageContent parse failed: " + e.getMessage());
             return null;
         } catch (Throwable t) {
+            // NPE / IndexOutOfBounds / 等都包住 —— 决不让线程死
             Log.e(TAG, "extractMessageContent unexpected", t);
             return null;
         }
     }
 
-    /**
-     * 把失败透传给回调，并做好异常隔离 —— 任何 callback 自身抛出的
-     * 异常都不能影响 OkHttp 线程。
-     */
-    private static void deliverFailure(@Nullable ResultCallback cb, @NonNull Throwable t) {
+    @NonNull
+    private static String snippetOf(@Nullable String s) {
+        if (s == null) return "";
+        return s.length() > 500 ? s.substring(0, 500) + "…" : s;
+    }
+
+    private static void invokeSuccess(@Nullable Callback cb, @NonNull String answer) {
+        if (cb == null) return;
+        try {
+            cb.onSuccess(answer);
+        } catch (Throwable t) {
+            Log.e(TAG, "callback.onSuccess threw", t);
+        }
+    }
+
+    private static void invokeFailure(@Nullable Callback cb, @NonNull Throwable t) {
         if (cb == null) return;
         try {
             cb.onFailure(t);
@@ -425,23 +517,17 @@ public final class AiVisionClient {
         }
     }
 
-    // ------------------------------------------------------------
+    // ============================================================
     // 类型
-    // ------------------------------------------------------------
+    // ============================================================
 
-    public interface ResultCallback {
-        void onSuccess(@NonNull Result result);
+    /**
+     * 主理人 v2 契约的回调接口。简单 onSuccess(String) / onFailure(Throwable)。
+     * <p>两个方法都在后台线程触发，调用方需自行切主线程做 UI。</p>
+     */
+    public interface Callback {
+        void onSuccess(@NonNull String answer);
 
         void onFailure(@NonNull Throwable error);
-    }
-
-    public static final class Result {
-        public final String content;
-        public final String rawJson;
-
-        public Result(@NonNull String content, @NonNull String rawJson) {
-            this.content = content;
-            this.rawJson = rawJson;
-        }
     }
 }

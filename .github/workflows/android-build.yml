@@ -1,0 +1,109 @@
+name: Android Debug Build
+
+# 触发：push 到 main / PR 到 main / 手动触发
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+# 同一 ref 串行排队；新 push 自动取消旧的
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: assembleDebug
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 — 拉全历史，方便 Gradle 解析 git 状态
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        # AGP 9.x 要求 JDK 17+（项目 build.gradle.kts 用的是 AGP 9.2.1）
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK (compileSdk 36)
+        uses: android-actions/setup-android@v3
+        with:
+          # 项目 compileSdk = release(36).minorApiLevel(1)
+          # 对应 platforms;android-36 + build-tools;36.0.0
+          api-level: 36
+          build-tools-version: 36.0.0
+          components: platform-tools,platforms;android-36,build-tools;36.0.0
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Show Gradle / Java versions
+        run: |
+          ./gradlew --version
+          java -version
+
+      - name: Accept Android SDK licenses
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
+      - name: Build Debug APK
+        env:
+          # 关掉 daemon，省 CI 资源
+          GRADLE_OPTS: "-Dorg.gradle.daemon=false -Xmx4g"
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Verify APK exists
+        run: |
+          ls -la app/build/outputs/apk/debug/
+          file app/build/outputs/apk/debug/*.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30
+          # compression-level: 0 — 不压缩打包，保留 APK 内部 local file header 字节序
+          # （压缩过 PowerShell 下载下来会偶尔破坏 central directory）
+          compression-level: 0
+
+      - name: Dump APK SHA256
+        run: |
+          sha256sum app/build/outputs/apk/debug/*.apk
+          echo "ARTIFACT_PATH=app/build/outputs/apk/debug/app-debug.apk"
+          echo "ARTIFACT_SIZE=$(stat -c%s app/build/outputs/apk/debug/app-debug.apk)"
+
+      - name: Upload build report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            app/build/reports/**
+            **/build/reports/**
+          retention-days: 7
+
+      # 终末 marker —— 不论 build 成功/失败都跑（if: always()），
+      # 让主理人能用 gh API / REST API 直接 grep 到本轮 run 的结论。
+      - name: Emit BUILD_RESULT marker
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "BUILD_RESULT=success"
+          elif [ "${{ job.status }}" = "cancelled" ]; then
+            echo "BUILD_RESULT=cancelled"
+          else
+            echo "BUILD_RESULT=failure"
+          fi
+          echo "BUILD_RUN_ID=${{ github.run_id }}"
+          echo "BUILD_RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

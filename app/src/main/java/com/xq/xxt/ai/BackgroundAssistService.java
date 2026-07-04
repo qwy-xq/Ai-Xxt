@@ -42,36 +42,24 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   /dev/input/event5: 0001 0072 00000001     # 同一物理按键可能在多个 event 节点上报
  * </pre>
  *
- * <p>两条关键修正：</p>
- * <ol>
- *   <li>不再 {@code ProcessBuilder("su")} 然后写 stdin —— Magisk 的 su
- *       在 stdin 关闭时会话立刻结束，{@code getevent} 来不及起来。改用
- *       {@code su -c "..."} 让命令绑定到 su 的整个生命周期；</li>
- *   <li>不再依赖 {@code getevent -l} 输出标签名 —— ColorOS / 部分 ROM 的
- *       toybox getevent 在 root 进程下输出格式不稳。直接用 raw 协议解析，
- *       即 {@code " 0001 0072 ..."} 这种固定格式。</li>
- * </ol>
- *
- * <h2>答案呈现双路径（v5）</h2>
+ * <h2>答案呈现分流（v2 主理人契约）</h2>
  *
  * <ul>
- *   <li><b>短答案（trim 后长度 ≤ {@value #SHORT_ANSWER_THRESHOLD}）</b>：用
- *       {@link RootCmdExecutor#systemToastAsync} 走系统底层 {@code am broadcast
- *       -a com.android.server.notification.Toast}，不产生应用层 window token，
- *       不会在最近任务里出现悬浮窗；</li>
- *   <li><b>长答案（> {@value #SHORT_ANSWER_THRESHOLD}）</b>：用
- *       {@link NotificationManager#notify} 推 BigTextStyle 通知；</li>
- *   <li><b>am broadcast 降级</b>：短答案 am broadcast 失败时（result.success ==
- *       false 或 callback 抛异常）自动降级到 Notification，确保一定有反馈。</li>
+ *   <li><b>拿到 answer 后必须切回主线程</b> —— 直接 {@code new Handler(Looper.getMainLooper()).post(...)}，
+ *       Notification / 系统 Toast 都在主线程做；</li>
+ *   <li><b>null / trim().isEmpty()</b>：用 NotificationManager 发一条 "未识别到答案" 高优先级
+ *       BigTextStyle 通知（独立 channel，IMPORTANCE_HIGH）；</li>
+ *   <li><b>trim().length() <= {@value #SHORT_ANSWER_THRESHOLD}</b>：走
+ *       {@link RootCmdExecutor#toast(String)} 弹系统广播 Toast —— 不产生应用层 window token，
+ *       不会在反作弊 / 录屏工具里出现悬浮窗；</li>
+ *   <li><b>其余</b>：用 NotificationManager + BigTextStyle 高优先级通知；</li>
+ *   <li><b>绝对不要</b>起任何 WindowManager 悬浮窗 —— 会被反作弊扫到。</li>
  * </ul>
  *
  * <h2>线程模型</h2>
  * <ul>
- *   <li>{@link #ioHandler}（HandlerThread 派发）：截屏、调用 Vision、am broadcast
- *       这些 IO 调度都走它；</li>
- *   <li>{@link #mainHandler}（主线程 Handler）：所有 UI 动作 —— Toast、
- *       Notification、Log + 落盘 —— 都切回这里做；</li>
- *   <li>ioHandler 里禁止直接 {@code nm.notify} / {@code Toast}。</li>
+ *   <li>{@link #ioHandler}（HandlerThread 派发）：截屏、调用 Vision、am broadcast 这些 IO 调度；</li>
+ *   <li>{@link #mainHandler}（主线程 Handler）：所有 UI 动作 —— Toast / Notification / Log。</li>
  * </ul>
  */
 public class BackgroundAssistService extends Service {
@@ -84,9 +72,9 @@ public class BackgroundAssistService extends Service {
     private static final long TRIGGER_WINDOW_MS = 500L;
 
     /**
-     * 短答案阈值：trim 后长度 ≤ 该值（包含等号）走系统 Toast；超过走通知。
+     * 短答案阈值：trim 后长度 ≤ 该值（包含等号）走系统 Toast。
      * <p>为什么 = 4：A/B/C/D 单字母 + True/False 都恰好 ≤ 4，能完整覆盖
-     * 选择题与判断题；超过 4 的基本上都是问答题文本，必须用 BigTextStyle。
+     * 选择题与判断题；超过 4 的基本都是问答题文本，必须用 BigTextStyle。</p>
      */
     private static final int SHORT_ANSWER_THRESHOLD = 4;
 
@@ -102,12 +90,9 @@ public class BackgroundAssistService extends Service {
      * 一次完整音量减按键产生两行：
      *   "... 0001 0072 00000001"   ← 按下（value=1）
      *   "... 0001 0072 00000000"   ← 抬起（value=0）
-     * 这里用 {@code "0001 0072"} 做 type+code 定位，再单独判断 value ≠ 0 即按下。
+     * 用 {@code "0001 0072"} 做 type+code 定位，再单独判断 value ≠ 0 即按下。
      */
     private static final String VOL_DOWN_TYPE_CODE = "0001 0072";
-
-    /** 系统 Toast 广播的 action —— ColorOS / 原生 AOSP 都认。 */
-    private static final String SYS_TOAST_ACTION = "com.android.server.notification.Toast";
 
     private HandlerThread ioThread;
     private Handler ioHandler;
@@ -138,10 +123,6 @@ public class BackgroundAssistService extends Service {
     private static final java.io.File DEBUG_LOG_FILE =
             new java.io.File("/data/data/com.xq.xxt.ai/cache/aixxt-debug.log");
 
-    /**
-     * 双写：logcat（实时）+ 文件（持久，绕过 logcat 缓冲滚动）。
-     * 任何抛错都吞掉 —— debug log 不能影响业务路径。
-     */
     private static synchronized void debugLog(@NonNull String tag, @NonNull String msg) {
         Log.i("AiXxtDbg", "[" + tag + "] " + msg);
         try {
@@ -158,9 +139,9 @@ public class BackgroundAssistService extends Service {
         }
     }
 
-    // ------------------------------------------------------------
+    // ============================================================
     // Service 生命周期
-    // ------------------------------------------------------------
+    // ============================================================
 
     @Override
     public void onCreate() {
@@ -225,9 +206,9 @@ public class BackgroundAssistService extends Service {
         return null;
     }
 
-    // ------------------------------------------------------------
+    // ============================================================
     // /dev/input 监听线程（v3：su -c getevent + raw 协议解析）
-    // ------------------------------------------------------------
+    // ============================================================
 
     private void startInputListener() {
         if (inputListenerAlive.get()) return;
@@ -247,13 +228,6 @@ public class BackgroundAssistService extends Service {
         }
     }
 
-    /**
-     * getevent 主循环。
-     *
-     * <p>采用 {@code Runtime.exec(String[])} 数组形式而非 {@code ProcessBuilder + stdin}，
-     * 避免 Magisk su 在 stdin EOF 时把整个 shell 收掉导致 getevent 来不及启动。
-     * 同时把 stderr 单独接到一个线程读，防止管道满导致 getevent 阻塞。</p>
-     */
     private void inputListenerLoop() {
         int retryDelayMs = 1000;
         while (inputListenerAlive.get()) {
@@ -265,7 +239,7 @@ public class BackgroundAssistService extends Service {
                 debugLog("ge", "spawning: su -c getevent -q 2>&1");
                 Log.i(TAG, "spawning: su -c getevent -q");
 
-                // 使用数组形式（不会经过 /system/bin/sh -c 的二次解析）
+                // 数组形式（不经过 /system/bin/sh -c 的二次解析）
                 process = Runtime.getRuntime().exec(new String[]{
                         "su",
                         "-c",
@@ -325,9 +299,6 @@ public class BackgroundAssistService extends Service {
         Log.i(TAG, "input listener thread exited");
     }
 
-    /**
-     * 后台抽干一个 InputStream（典型场景：getevent 的 stderr），避免缓冲区满阻塞子进程。
-     */
     @NonNull
     private static Thread drainStreamAsync(@NonNull InputStream in,
                                            @NonNull String tag,
@@ -353,9 +324,6 @@ public class BackgroundAssistService extends Service {
         return t;
     }
 
-    /**
-     * 单行解析：识别 volume-down 按下事件。
-     */
     private void handleGeteventLine(@NonNull String line) {
         if (!line.startsWith("/dev/input/")) return;
         if (!line.contains(VOL_DOWN_TYPE_CODE)) return;
@@ -411,14 +379,14 @@ public class BackgroundAssistService extends Service {
         return token;
     }
 
-    // ------------------------------------------------------------
-    // 流水线：截图 → Vision → 呈现
-    // ------------------------------------------------------------
+    // ============================================================
+    // 流水线：截屏 → Vision → 切主线程 → 呈现
+    // ============================================================
 
     /**
      * 入口：触发一次完整流水线。
      * <p>用 {@link AtomicBoolean#compareAndSet} 保证任何时候只有一个
-     * pipeline 在跑，新触发的会被丢弃并 Log.i。
+     * pipeline 在跑，新触发的会被丢弃并 Log.i。</p>
      */
     private void triggerPipeline(@NonNull String source) {
         if (!busy.compareAndSet(false, true)) {
@@ -427,67 +395,37 @@ public class BackgroundAssistService extends Service {
         }
         ioHandler.post(() -> {
             try {
-                // 1) 截图到 App 私有 cache 目录（自动 mkdir + chmod 666）
-                final String[] capturePathHolder = new String[1];
-                final boolean[] captureDone = {false};
-                RootCmdExecutor.get().captureScreenToAppCacheAsync(
-                        this, SCREENSHOT_NAME,
-                        r -> {
-                            try {
-                                if (r.success) {
-                                    capturePathHolder[0] =
-                                            RootCmdExecutor.resolveAppCachePath(this, SCREENSHOT_NAME);
-                                } else {
-                                    Log.w(TAG, "screencap failed: " + r);
-                                }
-                            } finally {
-                                synchronized (captureDone) {
-                                    captureDone[0] = true;
-                                    captureDone.notifyAll();
-                                }
-                            }
-                        });
-                synchronized (captureDone) {
-                    long deadline = System.currentTimeMillis() + 15_000L;
-                    while (!captureDone[0]) {
-                        long left = deadline - System.currentTimeMillis();
-                        if (left <= 0) break;
-                        try {
-                            captureDone.wait(left);
-                        } catch (InterruptedException ie) {
-                            Thread.currentThread().interrupt();
-                            break;
-                        }
-                    }
-                }
-
-                String capturePath = capturePathHolder[0];
-                if (capturePath == null || !RootCmdExecutor.fileExists(capturePath)) {
-                    Log.w(TAG, "screencap failed or file missing");
+                // 1) 截屏 —— RootCmdExecutor.screenshot() 是同步实现（内部守护线程跑 su），
+                //    不阻塞调用方太久
+                java.io.File png = RootCmdExecutor.screenshot(this);
+                if (png == null || !png.exists() || png.length() == 0L) {
+                    Log.w(TAG, "screencap failed or file missing/empty");
+                    // 主线程呈现失败通知
+                    mainHandler.post(() -> showLongAnswer("截图失败"));
                     return;
                 }
-                debugLog("pipeline", "screenshot ready: " + capturePath);
+                debugLog("pipeline", "screenshot ready: " + png.getAbsolutePath()
+                        + " (" + png.length() + " bytes)");
 
-                // 2) 调 Vision（ConfigStore 由 AiVisionClient 内部读取，永远拿最新）
-                String prompt = buildPrompt();
-                AiVisionClient.get().sendImageAsync(capturePath, prompt,
-                        new AiVisionClient.ResultCallback() {
-                            @Override
-                            public void onSuccess(@NonNull AiVisionClient.Result r) {
-                                // OkHttp 回调在子线程 —— 切回主线程呈现
-                                mainHandler.post(() -> presentAnswer(r.content));
-                            }
+                // 2) 调 Vision（一次性 Callback，不复用旧 ResultCallback）
+                AiVisionClient.get().analyze(png, new AiVisionClient.Callback() {
+                    @Override
+                    public void onSuccess(@NonNull String answer) {
+                        // OkHttp 回调在子线程 —— 切回主线程呈现
+                        mainHandler.post(() -> presentAnswer(answer));
+                    }
 
-                            @Override
-                            public void onFailure(@NonNull Throwable error) {
-                                Log.w(TAG, "vision failed: " + error.getMessage());
-                                // 失败也走通知（保持用户至少有反馈）
-                                mainHandler.post(() ->
-                                        showLongAnswer("AI 调用失败: " + error.getMessage()));
-                            }
-                        });
+                    @Override
+                    public void onFailure(@NonNull Throwable error) {
+                        Log.w(TAG, "vision failed: " + error.getMessage());
+                        // 失败也走通知（保持用户至少有反馈）
+                        mainHandler.post(() ->
+                                showLongAnswer("AI 调用失败: " + error.getMessage()));
+                    }
+                });
             } catch (Throwable t) {
                 Log.e(TAG, "pipeline error", t);
+                mainHandler.post(() -> showLongAnswer("内部异常: " + t.getClass().getSimpleName()));
             } finally {
                 busy.set(false);
             }
@@ -495,24 +433,33 @@ public class BackgroundAssistService extends Service {
     }
 
     /**
-     * 答案呈现分流器（v5）。
-     * <p>判定规则：
+     * 答案呈现分流器（v2 主理人契约）。
+     * <p><b>调用约定：</b>本方法必须在主线程上调用（pipeline 在 OkHttp 回调里通过
+     * {@link #mainHandler}.post 已经切回主线程，调用方无需再切）。</p>
+     * <p>判定规则：</p>
      * <ul>
-     *   <li>trim 后长度 ≤ {@value #SHORT_ANSWER_THRESHOLD}（含等号）：
-     *       走 {@link #showShortAnswer}（am broadcast 系统 Toast）；</li>
-     *   <li>否则：走 {@link #showLongAnswer}（BigTextStyle 通知）。</li>
+     *   <li>answer == null 或 trim().isEmpty() → "未识别到答案" 通知（高优先级 BigTextStyle）；</li>
+     *   <li>trim().length() <= {@value #SHORT_ANSWER_THRESHOLD} →
+     *       {@link RootCmdExecutor#toast(String)} 弹系统广播 Toast（不产生悬浮窗）；</li>
+     *   <li>其余 → BigTextStyle 通知（高优先级）。</li>
      * </ul>
-     * <p>am broadcast Toast 内部有降级逻辑 —— 失败会自动转通知。
      */
-    private void presentAnswer(@NonNull String answer) {
+    private void presentAnswer(@Nullable String answer) {
+        // 二次保险：如果在主线程以外被调到，自动切回主线程
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            final String a = answer;
+            mainHandler.post(() -> presentAnswer(a));
+            return;
+        }
+
         final String trimmed = answer == null ? "" : answer.trim();
         // 不管长短都先在 logcat + debug log 落盘一份，便于自动化 / 排查
         Log.i(TAG, "AI ANSWER: " + trimmed);
         debugLog("answer", "[" + trimmed.length() + " chars] " + trimmed);
 
         if (trimmed.isEmpty()) {
-            // 空内容：避免发一条空 Toast 触发奇怪行为，直接走通知
-            showLongAnswer("(空响应)");
+            // null 或空 → "未识别到答案" 高优先级通知
+            showLongAnswer("未识别到答案");
             return;
         }
 
@@ -524,53 +471,42 @@ public class BackgroundAssistService extends Service {
     }
 
     /**
-     * 短答案：系统广播 Toast，失败降级为通知。
-     * <p>为什么要切到 ioHandler：am broadcast 走 su，是 IO。
-     * 为什么要切回主线程：通知必须主线程。
+     * 短答案：系统广播 Toast。
+     * <p><b>为什么不在主线程直接 Toast.makeText(...).show()：</b>那种方式会创建应用层
+     * window token，在某些反作弊 / 录屏检测下会扫到悬浮窗。改走
+     * {@code RootCmdExecutor.toast(text)} = {@code am broadcast}，由系统 ToastService
+     * 在系统窗口里展示，对应用完全透明。</p>
+     * <p><b>为什么用 ioHandler：</b>{@code am broadcast} 走 su，是 IO；放回 IO 线程
+     * 不卡主线程。</p>
      */
     private void showShortAnswer(@NonNull String text) {
         // 文本前加 "AI提示: "，方便用户一眼看出来源
         final String toastText = "AI提示: " + text;
         debugLog("toast", "am broadcast Toast: " + toastText);
-
-        // 先在主线程尝试一次 Toast 兜底：万一广播没生效，至少应用层有显示
-        // （短答案在主线程直接 Toast 是允许的，因为 Toast.makeText 会切到 Toast 内部线程）
-        final Runnable fallbackToNotification = () -> {
-            Log.w(TAG, "am broadcast Toast unavailable, fallback to Notification");
-            debugLog("toast", "am broadcast failed, fallback to Notification");
-            showLongAnswer(text);
-        };
+        Log.i(TAG, "AI提示: " + toastText);
 
         ioHandler.post(() -> {
             try {
-                RootCmdExecutor.get().systemToastAsync(toastText, r -> {
-                    // am broadcast 回调也在 IO 线程上 —— 切回主线程
-                    mainHandler.post(() -> {
-                        try {
-                            if (r != null && r.success) {
-                                Log.i(TAG, "am broadcast Toast ok, exit=" + r.exitCode);
-                            } else {
-                                Log.w(TAG, "am broadcast Toast failed: " + r);
-                                fallbackToNotification.run();
-                            }
-                        } catch (Throwable t) {
-                            Log.e(TAG, "systemToast callback crashed", t);
-                            fallbackToNotification.run();
-                        }
-                    });
-                });
+                RootCmdExecutor.Result r = RootCmdExecutor.toast(toastText);
+                if (r == null || !r.success) {
+                    Log.w(TAG, "am broadcast Toast failed: " + r);
+                    debugLog("toast", "am broadcast failed, fallback to Notification");
+                    mainHandler.post(() -> showLongAnswer(text));
+                }
             } catch (Throwable t) {
-                Log.e(TAG, "systemToastAsync dispatch failed", t);
-                mainHandler.post(fallbackToNotification);
+                Log.e(TAG, "toast dispatch failed", t);
+                mainHandler.post(() -> showLongAnswer(text));
             }
         });
     }
 
     /**
-     * 长答案：BigTextStyle 通知。必须在主线程调用。
+     * 长答案 / 失败 / 空答案：BigTextStyle 通知。必须在主线程调用。
+     * <p><b>为什么走 NotificationManager + BigTextStyle：</b>长文本用系统 Toast 会被截断
+     * （部分 ROM 限制 200 字符以内），而通知的 BigTextStyle 没有这种限制。</p>
      */
     private void showLongAnswer(@NonNull String text) {
-        // 不论被谁调用，最终都切到主线程做 UI（避免某些路径下被 ioHandler 直接调）
+        // 二次保险
         if (Looper.myLooper() != Looper.getMainLooper()) {
             mainHandler.post(() -> showLongAnswer(text));
             return;
@@ -627,18 +563,15 @@ public class BackgroundAssistService extends Service {
         return text.substring(0, 80) + "…";
     }
 
-    @NonNull
-    private String buildPrompt() {
-        return "你是一个屏幕内容助手。请仔细查看这张截图，" +
-                "如果里面是选择题或判断题，只输出最终答案（字母或 True/False），不要解释；" +
-                "如果是问答题，给出简洁、可直接抄写的答案；" +
-                "如果没有可回答的内容，回复 'NO_QUESTION'。";
-    }
-
-    // ------------------------------------------------------------
+    // ============================================================
     // Notification Channel & KeepAlive
-    // ------------------------------------------------------------
+    // ============================================================
 
+    /**
+     * 创建 NotificationChannel（API 26+）。本项目 channelId = {@value #CHANNEL_ID}，
+     * 单独建一个 <b>IMPORTANCE_HIGH</b> 的 channel —— 这样答案通知可以走 heads-up，
+     * 用户在锁屏也能立刻看到，不会因为重要性太低被系统压住。
+     */
     private static void ensureNotificationChannel(@NonNull Context ctx) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
         NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
@@ -647,9 +580,14 @@ public class BackgroundAssistService extends Service {
         NotificationChannel channel = new NotificationChannel(
                 CHANNEL_ID,
                 "Assist Results",
-                NotificationManager.IMPORTANCE_DEFAULT);
-        channel.setDescription("AI 答题结果");
+                NotificationManager.IMPORTANCE_HIGH);
+        channel.setDescription("AI 答题结果（高优先级，锁屏可见）");
         channel.setShowBadge(false);
+        // 关键：允许绕过勿扰（部分 ROM 上要显式开启才能 heads-up）
+        try {
+            channel.setBypassDnd(false);
+        } catch (Throwable ignored) {
+        }
         nm.createNotificationChannel(channel);
     }
 
@@ -673,9 +611,9 @@ public class BackgroundAssistService extends Service {
         return builder.build();
     }
 
-    // ------------------------------------------------------------
+    // ============================================================
     // 辅助
-    // ------------------------------------------------------------
+    // ============================================================
 
     private static void closeQuietly(@Nullable java.io.Closeable c) {
         if (c != null) {

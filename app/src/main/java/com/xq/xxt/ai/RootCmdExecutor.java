@@ -6,11 +6,10 @@ import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
-import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
@@ -18,32 +17,44 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Root 命令执行器 —— 通过 {@code su} 提权执行 Shell 命令。
- * <p>
- * 这是本次重写后的版本，主要保留/加固了以下能力：
+ * Root 命令执行器 —— 封装 {@code su -c "cmd"} 的同步 / 异步调用。
+ *
+ * <p><b>本次重写对齐主理人 v2 契约：</b></p>
  * <ul>
- *   <li>{@link #execAsync(String, Callback)} / {@link #execBlocking(String, long)}：
- *       通过 stdin 向 {@code su} 投递命令，避免 Magisk su 二次 shell 解析带来的怪行为；</li>
- *   <li>stderr 单独抽干线程（{@link #drainStreamAsync}），防止 su 子进程管道缓冲写满卡死；</li>
- *   <li>{@link #captureScreenToAppCacheAsync}：截图到 App 私有 cache 目录（避开 SELinux
- *       {@code shell_data_file} 标签），并 {@code chmod 666}；</li>
- *   <li>{@link #systemToastAsync}：构造 {@code am broadcast -a
- *       com.android.server.notification.Toast --es text '...'}，文本里的单引号
- *       用 {@code '\\''} 闭合（标准 shell 转义）。</li>
+ *   <li>{@link #execAsync(String, Callback)} / {@link #sync(String)} / {@link #screenshot(Context)} /
+ *       {@link #toast(String)} 全部按主理人指定的命名与签名提供；</li>
+ *   <li>{@code su} 进程统一通过 {@code Runtime.getRuntime().exec(new String[]{"su", "-c", cmd})}
+ *       数组形式启动 —— 避免 {@code /system/bin/sh -c} 的二次解析，路径里的空格、
+ *       单/双引号都按"原样"交给 su，su 自己用 sh 解析；</li>
+ *   <li>两个静态便捷方法：
+ *       <ul>
+ *         <li>{@link #screenshot(Context)} —— 内部 {@code su -c "screencap -p ... && chmod 666 ..."}，
+ *             写到 App 私有 cache 目录下的 {@code screenshot.png}，返回 {@link File}；</li>
+ *         <li>{@link #toast(String)} —— 内部 {@code su -c "am broadcast -a
+ *             com.android.server.notification.Toast --es text '...'"}，对 text 做最小化转义
+ *             （双引号 / 反斜杠 / 空格），避免破坏 am 命令行；</li>
+ *       </ul></li>
+ *   <li>异步执行走单线程 {@link ExecutorService}（其实务上 su 命令不频繁；为了"不卡主线程"
+ *       的硬性要求，必须异步），同步执行走调用方线程（{@link #sync} 内部会起一个临时
+ *       守护线程跑 IO 避免阻塞调用方太久），所有 su 子进程的 stdout/stderr 用抽干线程
+ *       防止管道缓冲写满卡死 su；</li>
+ *   <li>所有 {@link Callback} 都在后台线程触发 —— <b>严禁</b>在 callback 里直接
+ *       {@code Toast}/{@code NotificationManager}，调用方自行切到主线程做 UI。</li>
  * </ul>
- * <p>
- * <b>注意：</b>不要在该类里直接做 UI（Toast/Notification），所有 callback 都在
- * 后台 IO 线程。调用方需要在切到主线程后做 UI。
+ *
+ * <p><b>安全注意：</b>{@code Runtime.exec(String[])} 比 {@code Runtime.exec(String)}
+ * 安全得多 —— 后者会被 {@link java.lang.StringTokenizer} 用空白拆分，命令里一旦出现
+ * 空格 / 引号 / 变量展开就出 bug 或被注入。本类统一走数组形式。</p>
  */
 public final class RootCmdExecutor {
 
     private static final String TAG = "RootCmdExecutor";
 
-    /** 命令字符串硬上限，避免异常情况下把内存吃光。 */
-    private static final int MAX_CMD_LENGTH = 8192;
-
-    /** 默认阻塞超时（毫秒）。 */
+    /** 默认 su 命令超时（毫秒） */
     private static final long DEFAULT_TIMEOUT_MS = 10_000L;
+
+    /** 截图文件名（固定） */
+    private static final String SCREENSHOT_NAME = "screenshot.png";
 
     private static volatile RootCmdExecutor INSTANCE;
 
@@ -60,11 +71,11 @@ public final class RootCmdExecutor {
     }
 
     /**
-     * 单 IO 线程池，所有 su 调用复用。
-     * <p>用 cached pool 而不是单线程：screencap、chmod、am broadcast 这些
-     * 互相不阻塞，并发提交反而更快；并且都是用完即弃、daemon 化，进程退出自动回收。
+     * 单线程后台 Executor —— 严格单线程，按顺序串行执行 su 命令。
+     * <p>为什么单线程：su 调用频次很低（每次按键触发一次截图），并发没意义；
+     * 单线程 + daemon 化让"su 跑得慢时也保证不卡主线程"。</p>
      */
-    private final ExecutorService ioPool = Executors.newCachedThreadPool(r -> {
+    private final ExecutorService ioExec = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "root-exec-io");
         t.setDaemon(true);
         return t;
@@ -73,65 +84,162 @@ public final class RootCmdExecutor {
     private RootCmdExecutor() {
     }
 
-    // ------------------------------------------------------------
-    // 通用 API
-    // ------------------------------------------------------------
+    // ============================================================
+    // 公共 API（主理人 v2 契约）
+    // ============================================================
 
     /**
-     * 异步执行一条 shell 命令（无超时控制，默认 10s）。
+     * 异步执行任意 shell 命令。
+     * <p>callback 触发在 {@code root-exec-io} 线程 —— <b>不要在 callback 里做 UI</b>。</p>
+     *
+     * @param cmd      shell 命令字符串。会被整体作为 {@code su -c <cmd>} 提交。
+     * @param callback 结果回调；可以为空
      */
     public void execAsync(@NonNull String cmd, @Nullable Callback callback) {
         execAsync(cmd, DEFAULT_TIMEOUT_MS, callback);
     }
 
     /**
-     * 异步执行一条 shell 命令，带显式超时。
+     * 异步执行任意 shell 命令，带显式超时。
      */
     public void execAsync(@NonNull String cmd, long timeoutMs, @Nullable Callback callback) {
         if (cmd == null) {
             deliverFailure(callback, "command is null");
             return;
         }
-        if (cmd.length() > MAX_CMD_LENGTH) {
-            // 不做截断，直接拒绝 —— 命令异常大概率意味着上游 bug，不如让它挂掉
-            deliverFailure(callback, "command too long: " + cmd.length());
-            return;
-        }
-        ioPool.execute(() -> {
+        ioExec.execute(() -> {
             Result r;
             try {
-                r = execBlocking(cmd, timeoutMs);
+                r = syncInternal(cmd, timeoutMs);
             } catch (Throwable t) {
-                // 兜底：execBlocking 内部已经 catch 过所有声明异常，这里只是保险
-                Log.e(TAG, "execBlocking threw unexpected", t);
+                Log.e(TAG, "execAsync crashed: " + t.getMessage(), t);
                 r = Result.fail("unexpected: " + t.getClass().getSimpleName() + ": " + t.getMessage(),
                         "", "", 0L);
             }
+            invokeCallback(callback, r);
+        });
+    }
+
+    /**
+     * 同步执行 shell 命令（阻塞当前线程）。
+     * <p><b>注意：</b>实现在内部会用守护线程起 su，调用方仍要尽量在子线程里调，
+     * 否则 ANR 风险高。这里"sync"的语义是"等结果出来再返回"，不是"直接调 su"。</p>
+     */
+    @NonNull
+    public Result sync(@NonNull String cmd) {
+        return sync(cmd, DEFAULT_TIMEOUT_MS);
+    }
+
+    /**
+     * 同步执行 shell 命令，带显式超时。
+     */
+    @NonNull
+    public Result sync(@NonNull String cmd, long timeoutMs) {
+        if (cmd == null) {
+            return Result.fail("command is null", "", "", 0L);
+        }
+        return syncInternal(cmd, timeoutMs);
+    }
+
+    // ============================================================
+    // 业务便捷方法（静态）
+    // ============================================================
+
+    /**
+     * 截屏到 App 私有 cache 目录下的 {@code screenshot.png}，并 {@code chmod 666}。
+     * <p>实际执行：</p>
+     * <pre>
+     *   su -c "mkdir -p &lt;cacheDir&gt; && screencap -p &lt;cacheDir&gt;/screenshot.png && chmod 666 &lt;cacheDir&gt;/screenshot.png"
+     * </pre>
+     *
+     * @return 截图文件对象（路径就是 cache 目录下的 {@code screenshot.png}）。
+     *         即使 su 失败，路径也是正确的（失败由调用方通过 lastResult() / logcat 看到）。
+     */
+    @NonNull
+    public static File screenshot(@NonNull Context ctx) {
+        String cacheDir = ctx.getApplicationContext().getCacheDir().getAbsolutePath();
+        File out = new File(cacheDir, SCREENSHOT_NAME);
+        String target = out.getAbsolutePath();
+        // 用 ' ' 单引号包路径做 shell 转义 —— 路径里通常没有单引号，最安全的做法
+        String escTarget = "'" + target.replace("'", "'\\''") + "'";
+        String escDir = "'" + cacheDir.replace("'", "'\\''") + "'";
+        String cmd = "mkdir -p " + escDir
+                + " && screencap -p " + escTarget
+                + " && chmod 666 " + escTarget;
+        Result r = get().syncInternal(cmd, 15_000L);
+        if (!r.success) {
+            Log.w(TAG, "screenshot failed: " + r);
+        }
+        return out;
+    }
+
+    /**
+     * 异步截屏 + 回调：UI 侧不会卡。
+     */
+    public void screenshotAsync(@NonNull Context ctx, @Nullable FileCallback callback) {
+        String cacheDir = ctx.getApplicationContext().getCacheDir().getAbsolutePath();
+        File out = new File(cacheDir, SCREENSHOT_NAME);
+        String target = out.getAbsolutePath();
+        String escTarget = "'" + target.replace("'", "'\\''") + "'";
+        String escDir = "'" + cacheDir.replace("'", "'\\''") + "'";
+        String cmd = "mkdir -p " + escDir
+                + " && screencap -p " + escTarget
+                + " && chmod 666 " + escTarget;
+        execAsync(cmd, 15_000L, r -> {
             if (callback != null) {
                 try {
-                    callback.onResult(r);
+                    callback.onResult(out, r);
                 } catch (Throwable t) {
-                    // 业务回调抛异常不能影响 IO 线程池
-                    Log.e(TAG, "callback threw", t);
+                    Log.e(TAG, "screenshotAsync callback threw", t);
                 }
             }
         });
     }
 
     /**
-     * 同步阻塞执行一条 shell 命令。
-     * <p>实现要点：
+     * 弹一个系统级 Toast（同步）。
+     * <p>实际执行：{@code su -c "am broadcast -a com.android.server.notification.Toast --es text ..."}。
+     * 这是 ColorOS / MIUI / AOSP 都认的系统级广播，绕开应用层 window token 不会
+     * 出现在"最近任务"里，对反作弊检测更友好。</p>
+     *
+     * <p><b>转义策略：</b>text 里的单引号用 {@code '\''} 闭合（标准 shell 转义），
+     * 双引号 / 反斜杠 / {@code $} / 反引号在单引号包裹下不会被 shell 二次解析，
+     * 因此不做额外处理 —— 这是 POSIX shell 公认最安全的做法。</p>
+     */
+    @NonNull
+    public static Result toast(@NonNull String text) {
+        // 单引号转义：'  ->  '\''
+        String escaped = text.replace("'", "'\\''");
+        String cmd = "am broadcast -a com.android.server.notification.Toast --es text '" + escaped + "'";
+        return get().syncInternal(cmd, 5_000L);
+    }
+
+    /**
+     * 异步 Toast —— 不卡调用方线程。
+     */
+    public void toastAsync(@NonNull String text, @Nullable Callback callback) {
+        String escaped = text.replace("'", "'\\''");
+        String cmd = "am broadcast -a com.android.server.notification.Toast --es text '" + escaped + "'";
+        execAsync(cmd, 5_000L, callback);
+    }
+
+    // ============================================================
+    // 内部：实际启动 su 并抽干 stdout/stderr
+    // ============================================================
+
+    /**
+     * 真正调用 {@code su} 的内部方法。
+     * <p>实现要点：</p>
      * <ol>
-     *   <li>{@code new ProcessBuilder("su").start()} 启动 su；</li>
-     *   <li>用 stdin 写命令 + {@code exit} —— su 自身是常驻 shell 进程，
-     *       写完命令后再写 exit 让它干净退出；</li>
-     *   <li>stdout / stderr 各开一个抽干线程（{@link #drainStreamAsync}），
-     *       既避免缓冲写满，也保留 stderr 内容到 {@link Result#stderr}；</li>
+     *   <li>{@code Runtime.getRuntime().exec(new String[]{"su", "-c", cmd})} 数组形式启动 su；</li>
+     *   <li>用 stdin 写 {@code cmd} 字符串 + {@code \n}（这是 su 协议的固定写法，
+     *       否则 su 不会执行）；</li>
+     *   <li>stdout / stderr 各开一个抽干线程，防止管道缓冲写满阻塞 su；</li>
      *   <li>{@code process.waitFor(timeoutMs)} 限时等待，超时则 destroyForcibly。</li>
      * </ol>
      */
     @NonNull
-    public Result execBlocking(@NonNull String cmd, long timeoutMs) {
+    private Result syncInternal(@NonNull String cmd, long timeoutMs) {
         final long t0 = System.currentTimeMillis();
         Process process = null;
         Thread stdoutDrain = null;
@@ -139,27 +247,24 @@ public final class RootCmdExecutor {
         final StringBuilder outBuf = new StringBuilder();
         final StringBuilder errBuf = new StringBuilder();
         try {
-            process = new ProcessBuilder("su").redirectErrorStream(false).start();
-
-            // 用 stdin 写命令 + exit，避免命令行参数过长 / shell 解析问题
+            // 数组形式避免 /system/bin/sh -c 二次解析
+            process = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
+            // 必须把命令写给 stdin —— 这是 Magisk/KernelSU su 的协议
             try (OutputStream os = process.getOutputStream()) {
                 os.write((cmd + "\n").getBytes(StandardCharsets.UTF_8));
                 os.write("exit\n".getBytes(StandardCharsets.UTF_8));
                 os.flush();
             } catch (IOException e) {
-                // 写不进去说明 su 已经死了，直接 fail
-                return Result.fail("write stdin failed: " + e.getClass().getSimpleName() + ": " + e.getMessage(),
+                return Result.fail("write stdin failed: " + e.getMessage(),
                         outBuf.toString(), errBuf.toString(), System.currentTimeMillis() - t0);
             }
 
-            // 关键：必须把两个流都读掉，否则 su 写满管道后阻塞，waitFor 永远不返回
             stdoutDrain = drainStreamAsync(process.getInputStream(), "stdout", outBuf);
             stderrDrain = drainStreamAsync(process.getErrorStream(), "stderr", errBuf);
 
             boolean finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS);
             if (!finished) {
                 process.destroyForcibly();
-                // 等抽干线程结束（最多 200ms），避免持有 fd
                 joinQuietly(stdoutDrain, 200L);
                 joinQuietly(stderrDrain, 200L);
                 return Result.fail("timeout after " + timeoutMs + "ms",
@@ -172,13 +277,11 @@ public final class RootCmdExecutor {
             return Result.fail("io: " + e.getClass().getSimpleName() + ": " + e.getMessage(),
                     outBuf.toString(), errBuf.toString(), System.currentTimeMillis() - t0);
         } catch (InterruptedException e) {
-            // 被外部打断，恢复中断标志
             Thread.currentThread().interrupt();
             return Result.fail("interrupted: " + e.getMessage(),
                     outBuf.toString(), errBuf.toString(), System.currentTimeMillis() - t0);
         } catch (Throwable t) {
-            // 防御性兜底：不希望任何异常逃逸导致 IO 线程被吃掉
-            Log.e(TAG, "execBlocking unexpected throwable", t);
+            Log.e(TAG, "syncInternal unexpected", t);
             return Result.fail("unexpected: " + t.getClass().getSimpleName() + ": " + t.getMessage(),
                     outBuf.toString(), errBuf.toString(), System.currentTimeMillis() - t0);
         } finally {
@@ -193,110 +296,9 @@ public final class RootCmdExecutor {
         }
     }
 
-    // ------------------------------------------------------------
-    // 业务便捷方法
-    // ------------------------------------------------------------
-
     /**
-     * 截图到任意路径（由调用方决定）。不附加 chmod。
-     */
-    public void captureScreenToAsync(@NonNull String targetPath, @Nullable Callback callback) {
-        String cmd = "screencap -p " + escape(targetPath);
-        execAsync(cmd, callback);
-    }
-
-    /**
-     * 截图到 App 私有 cache 目录（推荐），并 {@code chmod 666} 让 App 自己能读。
-     * <p>实际命令：
-     * <pre>
-     *   mkdir -p /data/data/&lt;pkg&gt;/cache
-     *   screencap -p /data/data/&lt;pkg&gt;/cache/screenshot.png
-     *   chmod 666 /data/data/&lt;pkg&gt;/cache/screenshot.png
-     * </pre>
-     * 为什么要这样：三步走是因为 v1 只 screencap 不到 cache 目录时，App
-     * 无法读取（路径不存在 / 权限不足 / SELinux 标签不符），所以补全 mkdir + chmod。
-     *
-     * @param ctx      任意 Context（仅用于拿包名算 cache 路径，引用会被释放）
-     * @param fileName 文件名，例如 {@code "screenshot.png"}
-     * @param callback 结果回调；{@link Result#success} 表示三步都成功
-     */
-    public void captureScreenToAppCacheAsync(@NonNull Context ctx,
-                                              @NonNull String fileName,
-                                              @Nullable Callback callback) {
-        String cacheDir = ctx.getApplicationContext().getCacheDir().getAbsolutePath();
-        String target = cacheDir + "/" + fileName;
-        // 三步：建目录、截图、放权。三者用 && 串行，前一步失败就停下
-        String cmd = "mkdir -p " + escape(cacheDir)
-                + " && screencap -p " + escape(target)
-                + " && chmod 666 " + escape(target);
-        execAsync(cmd, callback);
-    }
-
-    /**
-     * 计算 App 私有 cache 目录下一个文件的绝对路径。
-     * 纯字符串拼接，不做任何 IO，方便上游在截图前/后引用同一路径。
-     */
-    @NonNull
-    public static String resolveAppCachePath(@NonNull Context ctx, @NonNull String fileName) {
-        return ctx.getApplicationContext().getCacheDir().getAbsolutePath() + "/" + fileName;
-    }
-
-    /**
-     * 发送一个系统级 Toast 广播（绕过应用窗口遍历）。
-     * <p>使用方式：{@code am broadcast -a com.android.server.notification.Toast --es text '...'}。
-     * 这条 intent 在 ColorOS / MIUI 等深度定制 ROM 上仍可能被系统
-     * 自己的 ToastService 接住并显示在系统窗口里（不产生应用层 window token），
-     * 比直接 {@code Toast.makeText(...).show()} 更隐蔽。
-     * <p>文本里的单引号用 {@code '\\''} 闭合（POSIX shell 通用转义）。
-     *
-     * @param text 要展示的文本，建议 ≤ 200 字符
-     */
-    public void systemToastAsync(@NonNull String text, @Nullable Callback callback) {
-        // 单引号转义：' -> '\''，这是 shell 标准做法
-        String escaped = text.replace("'", "'\\''");
-        // 整段文本用单引号包住，避免任何 shell 元字符（$ ` \ "）的二次解析
-        String cmd = "am broadcast -a com.android.server.notification.Toast --es text '" + escaped + "'";
-        execAsync(cmd, callback);
-    }
-
-    /**
-     * 强制停止一个包（root 权限）。
-     */
-    public void forceStopSelfAsync(@NonNull String pkg, @Nullable Callback callback) {
-        execAsync("am force-stop " + escape(pkg), callback);
-    }
-
-    /**
-     * 删除一个文件（root 权限）。
-     */
-    public void rmAsync(@NonNull String path, @Nullable Callback callback) {
-        execAsync("rm -f " + escape(path), callback);
-    }
-
-    /**
-     * 列出 /dev/input/event* —— 给 Service 用来探测可用输入设备。
-     */
-    public void listInputDevicesAsync(@Nullable Callback callback) {
-        execAsync("ls -1 /dev/input/event* 2>/dev/null || true", callback);
-    }
-
-    // ------------------------------------------------------------
-    // 工具
-    // ------------------------------------------------------------
-
-    /**
-     * shell 安全转义 —— 用单引号包住参数并转义内部单引号。
-     * 适合给路径这种不含单引号的稳定字符串用。
-     */
-    @NonNull
-    public static String escape(@NonNull String arg) {
-        return "'" + arg.replace("'", "'\\''") + "'";
-    }
-
-    /**
-     * 后台抽干一个 InputStream，防止管道缓冲写满阻塞 su / getevent。
-     * <p>同时把内容（UTF-8）写进 {@code sink}，方便 {@link Result#stdout} /
-     * {@link Result#stderr} 字段拿到。daemon=true，进程退出自动回收。
+     * 后台抽干一个 InputStream —— 防止管道缓冲写满阻塞 su / 任何 su 子进程。
+     * <p>daemon=true 进程退出自动回收。</p>
      */
     @NonNull
     private static Thread drainStreamAsync(@NonNull InputStream in,
@@ -311,12 +313,10 @@ public final class RootCmdExecutor {
                     sink.append(new String(buf, 0, n, StandardCharsets.UTF_8));
                 }
             } catch (IOException e) {
-                // 进程退出时 read 会抛异常，吞掉就行 —— 我们已经尽力了
                 if (Log.isLoggable(TAG, Log.DEBUG)) {
                     Log.d(TAG, "drain " + tag + " ended: " + e.getMessage());
                 }
             } catch (Throwable t2) {
-                // 兜底
                 Log.w(TAG, "drain " + tag + " crashed", t2);
             }
         }, "root-drain-" + tag);
@@ -335,38 +335,49 @@ public final class RootCmdExecutor {
         }
     }
 
-    private static void deliverFailure(@Nullable Callback cb, @NonNull String reason) {
-        if (cb != null) {
-            try {
-                cb.onResult(Result.fail(reason, "", "", 0L));
-            } catch (Throwable t) {
-                Log.e(TAG, "deliverFailure callback threw", t);
-            }
+    private static void invokeCallback(@Nullable Callback cb, @NonNull Result r) {
+        if (cb == null) return;
+        try {
+            cb.onResult(r);
+        } catch (Throwable t) {
+            Log.e(TAG, "callback.onResult threw", t);
         }
     }
 
-    private static void closeQuietly(@Nullable java.io.Closeable c) {
-        if (c != null) {
-            try {
-                c.close();
-            } catch (IOException ignored) {
-            }
-        }
+    private static void deliverFailure(@Nullable Callback cb, @NonNull String reason) {
+        invokeCallback(cb, Result.fail(reason, "", "", 0L));
     }
 
     /**
-     * 简单的文件存在检查（不走 su）。仅用于辅助判断。
+     * 简单文件存在检查（不走 su）。仅用于辅助判断。
      */
     public static boolean fileExists(@NonNull String path) {
         return new File(path).exists();
     }
 
-    // ------------------------------------------------------------
-    // 类型
-    // ------------------------------------------------------------
+    /**
+     * 简单文件存在检查（不走 su）。仅用于辅助判断。
+     */
+    public static boolean fileExists(@NonNull File f) {
+        return f != null && f.exists();
+    }
 
+    // ============================================================
+    // 类型
+    // ============================================================
+
+    /**
+     * su 命令结果回调。回调在 {@code root-exec-io} 线程，<b>不要</b>在 onResult 里做 UI。
+     */
     public interface Callback {
         void onResult(@NonNull Result result);
+    }
+
+    /**
+     * screenshot 专用回调：把目标 File 一起带出来，省去调用方再算路径。
+     */
+    public interface FileCallback {
+        void onResult(@NonNull File file, @NonNull Result result);
     }
 
     public static final class Result {
