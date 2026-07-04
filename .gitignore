@@ -31,6 +31,11 @@ local.properties
 secrets.properties
 google-services.json
 
+# 根目录的运行时配置文件（可能含 apiKey 等敏感信息）
+/config.xml
+/secrets.xml
+/keystore.properties
+
 # Gradle wrapper jar 之外的临时文件
 .gradletasknamecache
 

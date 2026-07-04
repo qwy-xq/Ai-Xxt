@@ -32,7 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <h2>按键监听架构（v3）</h2>
  *
- * 通过 {@code Runtime.exec(new String[]{"su", "-c", "getevent -q"})} 启动一个
+ * 通过 {@code Runtime.exec(new String[]{"su", "-c", "getevent -q 2>&1"})} 启动一个
  * root shell 常驻子进程，让内核 input 子系统把硬件事件以 raw 协议格式
  * （十六进制 type/code/value）打到 stdout：
  *
@@ -46,16 +46,33 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <ol>
  *   <li>不再 {@code ProcessBuilder("su")} 然后写 stdin —— Magisk 的 su
  *       在 stdin 关闭时会话立刻结束，{@code getevent} 来不及起来。改用
- *       {@code su -c "..."} 让命令绑定到 su 的整个生命周期。</li>
+ *       {@code su -c "..."} 让命令绑定到 su 的整个生命周期；</li>
  *   <li>不再依赖 {@code getevent -l} 输出标签名 —— ColorOS / 部分 ROM 的
  *       toybox getevent 在 root 进程下输出格式不稳。直接用 raw 协议解析，
- *       即 {@code " 0001 0072 ..."} 这种固定格式（hex 形式 / 短形式都覆盖）。</li>
+ *       即 {@code " 0001 0072 ..."} 这种固定格式。</li>
  * </ol>
  *
- * <p>全局监听 {@code /dev/input/event*}（不给 getevent 传具体设备路径），
- * 因此不锁死具体 event 节点，适配一加 Pad Pro 上节点编号变化的情况。</p>
+ * <h2>答案呈现双路径（v5）</h2>
  *
- * <p>触发手势：500ms 内连续按 2 次音量减（type=0x0001, code=0x0072, value≠0）。</p>
+ * <ul>
+ *   <li><b>短答案（trim 后长度 ≤ {@value #SHORT_ANSWER_THRESHOLD}）</b>：用
+ *       {@link RootCmdExecutor#systemToastAsync} 走系统底层 {@code am broadcast
+ *       -a com.android.server.notification.Toast}，不产生应用层 window token，
+ *       不会在最近任务里出现悬浮窗；</li>
+ *   <li><b>长答案（> {@value #SHORT_ANSWER_THRESHOLD}）</b>：用
+ *       {@link NotificationManager#notify} 推 BigTextStyle 通知；</li>
+ *   <li><b>am broadcast 降级</b>：短答案 am broadcast 失败时（result.success ==
+ *       false 或 callback 抛异常）自动降级到 Notification，确保一定有反馈。</li>
+ * </ul>
+ *
+ * <h2>线程模型</h2>
+ * <ul>
+ *   <li>{@link #ioHandler}（HandlerThread 派发）：截屏、调用 Vision、am broadcast
+ *       这些 IO 调度都走它；</li>
+ *   <li>{@link #mainHandler}（主线程 Handler）：所有 UI 动作 —— Toast、
+ *       Notification、Log + 落盘 —— 都切回这里做；</li>
+ *   <li>ioHandler 里禁止直接 {@code nm.notify} / {@code Toast}。</li>
+ * </ul>
  */
 public class BackgroundAssistService extends Service {
 
@@ -66,8 +83,12 @@ public class BackgroundAssistService extends Service {
     /** 两次音量减之间的最大间隔（ms） */
     private static final long TRIGGER_WINDOW_MS = 500L;
 
-    /** 短答案阈值：超过这个长度走通知栏 */
-    private static final int SHORT_ANSWER_THRESHOLD = 60;
+    /**
+     * 短答案阈值：trim 后长度 ≤ 该值（包含等号）走系统 Toast；超过走通知。
+     * <p>为什么 = 4：A/B/C/D 单字母 + True/False 都恰好 ≤ 4，能完整覆盖
+     * 选择题与判断题；超过 4 的基本上都是问答题文本，必须用 BigTextStyle。
+     */
+    private static final int SHORT_ANSWER_THRESHOLD = 4;
 
     private static final String CHANNEL_ID = "assist_results";
     private static final int NOTIF_ID_KEEP_ALIVE = 0xA15E;
@@ -81,11 +102,12 @@ public class BackgroundAssistService extends Service {
      * 一次完整音量减按键产生两行：
      *   "... 0001 0072 00000001"   ← 按下（value=1）
      *   "... 0001 0072 00000000"   ← 抬起（value=0）
-     * 短形式 value 会被打印成 1 / 0 / 2（2=repeat）。
-     * 这里用 {@code VOL_DOWN_TYPE_CODE} = "0001 0072"} 做 type+code 定位，
-     * 再单独判断 value ≠ 0 即按下动作。
+     * 这里用 {@code "0001 0072"} 做 type+code 定位，再单独判断 value ≠ 0 即按下。
      */
     private static final String VOL_DOWN_TYPE_CODE = "0001 0072";
+
+    /** 系统 Toast 广播的 action —— ColorOS / 原生 AOSP 都认。 */
+    private static final String SYS_TOAST_ACTION = "com.android.server.notification.Toast";
 
     private HandlerThread ioThread;
     private Handler ioHandler;
@@ -116,8 +138,11 @@ public class BackgroundAssistService extends Service {
     private static final java.io.File DEBUG_LOG_FILE =
             new java.io.File("/data/data/com.xq.xxt.ai/cache/aixxt-debug.log");
 
+    /**
+     * 双写：logcat（实时）+ 文件（持久，绕过 logcat 缓冲滚动）。
+     * 任何抛错都吞掉 —— debug log 不能影响业务路径。
+     */
     private static synchronized void debugLog(@NonNull String tag, @NonNull String msg) {
-        // 同时写到 logcat，便于即使 cache 目录写不进去也能看到
         Log.i("AiXxtDbg", "[" + tag + "] " + msg);
         try {
             String line = "[" + new java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US)
@@ -128,7 +153,8 @@ public class BackgroundAssistService extends Service {
                 bw.flush();
             }
         } catch (Throwable t) {
-            Log.w("AiXxtDbg", "debugLog file write failed: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+            Log.w("AiXxtDbg", "debugLog file write failed: "
+                    + t.getClass().getSimpleName() + ": " + t.getMessage());
         }
     }
 
@@ -166,7 +192,6 @@ public class BackgroundAssistService extends Service {
             registerReceiver(externalReceiver, filter);
         }
 
-        // 启动 /dev/input 监听线程
         debugLog("onCreate", "service started, scheduling input listener");
         startInputListener();
     }
@@ -204,16 +229,6 @@ public class BackgroundAssistService extends Service {
     // /dev/input 监听线程（v3：su -c getevent + raw 协议解析）
     // ------------------------------------------------------------
 
-    /**
-     * 启动常驻线程。
-     * <p>线程主体在 {@link #inputListenerLoop()} 里：
-     * <ol>
-     *   <li>{@code Runtime.exec(new String[]{"su", "-c", "getevent -q"})} 启动 root 子进程；</li>
-     *   <li>{@code su} 接管命令后挂住不退出，{@code getevent} 进入常驻监听；</li>
-     *   <li>父进程从子进程 stdout 按行读取 raw input_event；</li>
-     *   <li>命中音量减按下事件 → 累计连击，达到 2 次立刻触发流水线。</li>
-     * </ol>
-     */
     private void startInputListener() {
         if (inputListenerAlive.get()) return;
         inputListenerAlive.set(true);
@@ -250,18 +265,15 @@ public class BackgroundAssistService extends Service {
                 debugLog("ge", "spawning: su -c getevent -q 2>&1");
                 Log.i(TAG, "spawning: su -c getevent -q");
 
-                // 注意：使用数组形式（不会经过 /system/bin/sh -c 的二次解析）
-                // 这样 getevent 的所有参数都直达 su shell。
+                // 使用数组形式（不会经过 /system/bin/sh -c 的二次解析）
                 process = Runtime.getRuntime().exec(new String[]{
                         "su",
                         "-c",
                         "getevent -q 2>&1"
                 });
                 geteventProcess = process;
-                debugLog("ge", "spawned pid=" + (process != null ? safePid(process) : "null"));
+                debugLog("ge", "spawned pid=" + safePid(process));
 
-                // 单独起一个线程把 stderr 抽干，防止管道缓冲区满卡住 getevent。
-                // 同时把内容写到 stderrBuf，结束后 dump 到 debug log 方便诊断。
                 stderrDrainThread = drainStreamAsync(process.getErrorStream(), "stderr", stderrBuf);
 
                 InputStream stdout = process.getInputStream();
@@ -282,7 +294,7 @@ public class BackgroundAssistService extends Service {
                 Log.w(TAG, "getevent loop crashed: " + t.getClass().getSimpleName()
                         + ": " + t.getMessage());
                 debugLog("ge-err", t.getClass().getSimpleName() + ": " + t.getMessage());
-                debugLog("ge-err-stderr", stderrBuf.toString(java.nio.charset.StandardCharsets.UTF_8));
+                debugLog("ge-err-stderr", stderrBuf.toString(StandardCharsets.UTF_8));
             } finally {
                 geteventProcess = null;
                 closeQuietly(reader);
@@ -317,8 +329,9 @@ public class BackgroundAssistService extends Service {
      * 后台抽干一个 InputStream（典型场景：getevent 的 stderr），避免缓冲区满阻塞子进程。
      */
     @NonNull
-    private static Thread drainStreamAsync(@NonNull InputStream in, @NonNull String tag,
-                                          @Nullable java.io.ByteArrayOutputStream sink) {
+    private static Thread drainStreamAsync(@NonNull InputStream in,
+                                           @NonNull String tag,
+                                           @Nullable java.io.ByteArrayOutputStream sink) {
         Thread t = new Thread(() -> {
             byte[] buf = new byte[512];
             try {
@@ -326,9 +339,9 @@ public class BackgroundAssistService extends Service {
                 while (!Thread.currentThread().isInterrupted()
                         && (n = in.read(buf)) > 0) {
                     if (sink != null) sink.write(buf, 0, n);
-                    // 选择性记录：getevent 偶尔会向 stderr 喷 warning，不影响主逻辑
                     if (Log.isLoggable(TAG, Log.DEBUG)) {
-                        Log.d(TAG, "[" + tag + "] " + new String(buf, 0, n, StandardCharsets.UTF_8).trim());
+                        Log.d(TAG, "[" + tag + "] "
+                                + new String(buf, 0, n, StandardCharsets.UTF_8).trim());
                     }
                 }
             } catch (IOException ignored) {
@@ -342,30 +355,11 @@ public class BackgroundAssistService extends Service {
 
     /**
      * 单行解析：识别 volume-down 按下事件。
-     *
-     * <p>getevent raw 输出示例（不含 -l 标签、含 -q 静默）：</p>
-     * <pre>
-     *   add device 1: /dev/input/event4
-     *   /dev/input/event4: 0001 0072 00000001   ← 按下
-     *   /dev/input/event4: 0001 0072 00000000   ← 抬起
-     *   /dev/input/event5: 0001 0072 00000002   ← 长按 repeat
-     * </pre>
-     *
-     * <p>判定条件（不做设备节点白名单，event* 都接）：</p>
-     * <ul>
-     *   <li>行首必须是 {@code /dev/input/} 开头（过滤掉 "add device" 这种启动行）；</li>
-     *   <li>行内包含 {@code " 0001 0072"}（type=EV_KEY, code=KEY_VOLUMEDOWN）；</li>
-     *   <li>value ≠ 0：按下（1）或长按 repeat（2），抬起（0）忽略。</li>
-     * </ul>
      */
     private void handleGeteventLine(@NonNull String line) {
-        // 1. 必须是 /dev/input/event* 开头的事件行，过滤掉 "add device" 这种元信息
         if (!line.startsWith("/dev/input/")) return;
-
-        // 2. 必须包含 type+code 关键字
         if (!line.contains(VOL_DOWN_TYPE_CODE)) return;
 
-        // 3. 提取 value（行尾最后一个 hex token）
         String valueHex = extractTrailingHex(line);
         if (valueHex == null) return;
 
@@ -377,7 +371,6 @@ public class BackgroundAssistService extends Service {
         }
 
         // value=0 → 抬起；value=1 → 按下；value=2 → 长按 repeat
-        // 仅按下/长按触发连击计数，抬起忽略。
         if (value == 0) return;
 
         long now = SystemClock.elapsedRealtime();
@@ -395,26 +388,14 @@ public class BackgroundAssistService extends Service {
         }
     }
 
-    /**
-     * 从 getevent 输出行里提取行尾的十六进制 token。
-     * <p>支持格式：</p>
-     * <ul>
-     *   <li>{@code "... 0001 0072 00000001"} → 返回 {@code "00000001"}</li>
-     *   <li>{@code "... 0001 0072 1"}         → 返回 {@code "1"}（短形式）</li>
-     * </ul>
-     *
-     * @return 十六进制字符串（不带 0x 前缀）；解析失败返回 null
-     */
     @Nullable
     private static String extractTrailingHex(@NonNull String line) {
-        // 去掉尾部空白
         int end = line.length();
         while (end > 0 && Character.isWhitespace(line.charAt(end - 1))) {
             end--;
         }
         if (end == 0) return null;
 
-        // 从 end 往前找到第一个空白（token 分隔符）
         int start = end;
         while (start > 0 && !Character.isWhitespace(line.charAt(start - 1))) {
             start--;
@@ -422,7 +403,6 @@ public class BackgroundAssistService extends Service {
         if (start == end) return null;
 
         String token = line.substring(start, end);
-        // 必须是纯十六进制字符
         for (int i = 0; i < token.length(); i++) {
             char c = token.charAt(i);
             boolean ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
@@ -435,6 +415,11 @@ public class BackgroundAssistService extends Service {
     // 流水线：截图 → Vision → 呈现
     // ------------------------------------------------------------
 
+    /**
+     * 入口：触发一次完整流水线。
+     * <p>用 {@link AtomicBoolean#compareAndSet} 保证任何时候只有一个
+     * pipeline 在跑，新触发的会被丢弃并 Log.i。
+     */
     private void triggerPipeline(@NonNull String source) {
         if (!busy.compareAndSet(false, true)) {
             Log.i(TAG, "pipeline already running, ignore trigger from " + source);
@@ -448,13 +433,18 @@ public class BackgroundAssistService extends Service {
                 RootCmdExecutor.get().captureScreenToAppCacheAsync(
                         this, SCREENSHOT_NAME,
                         r -> {
-                            if (r.success) {
-                                capturePathHolder[0] =
-                                        RootCmdExecutor.resolveAppCachePath(this, SCREENSHOT_NAME);
-                            }
-                            synchronized (captureDone) {
-                                captureDone[0] = true;
-                                captureDone.notifyAll();
+                            try {
+                                if (r.success) {
+                                    capturePathHolder[0] =
+                                            RootCmdExecutor.resolveAppCachePath(this, SCREENSHOT_NAME);
+                                } else {
+                                    Log.w(TAG, "screencap failed: " + r);
+                                }
+                            } finally {
+                                synchronized (captureDone) {
+                                    captureDone[0] = true;
+                                    captureDone.notifyAll();
+                                }
                             }
                         });
                 synchronized (captureDone) {
@@ -462,7 +452,12 @@ public class BackgroundAssistService extends Service {
                     while (!captureDone[0]) {
                         long left = deadline - System.currentTimeMillis();
                         if (left <= 0) break;
-                        captureDone.wait(left);
+                        try {
+                            captureDone.wait(left);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
                     }
                 }
 
@@ -471,6 +466,7 @@ public class BackgroundAssistService extends Service {
                     Log.w(TAG, "screencap failed or file missing");
                     return;
                 }
+                debugLog("pipeline", "screenshot ready: " + capturePath);
 
                 // 2) 调 Vision（ConfigStore 由 AiVisionClient 内部读取，永远拿最新）
                 String prompt = buildPrompt();
@@ -478,13 +474,16 @@ public class BackgroundAssistService extends Service {
                         new AiVisionClient.ResultCallback() {
                             @Override
                             public void onSuccess(@NonNull AiVisionClient.Result r) {
-                                presentAnswer(r.content);
+                                // OkHttp 回调在子线程 —— 切回主线程呈现
+                                mainHandler.post(() -> presentAnswer(r.content));
                             }
 
                             @Override
                             public void onFailure(@NonNull Throwable error) {
                                 Log.w(TAG, "vision failed: " + error.getMessage());
-                                showLongAnswer("AI 调用失败: " + error.getMessage());
+                                // 失败也走通知（保持用户至少有反馈）
+                                mainHandler.post(() ->
+                                        showLongAnswer("AI 调用失败: " + error.getMessage()));
                             }
                         });
             } catch (Throwable t) {
@@ -495,51 +494,131 @@ public class BackgroundAssistService extends Service {
         });
     }
 
+    /**
+     * 答案呈现分流器（v5）。
+     * <p>判定规则：
+     * <ul>
+     *   <li>trim 后长度 ≤ {@value #SHORT_ANSWER_THRESHOLD}（含等号）：
+     *       走 {@link #showShortAnswer}（am broadcast 系统 Toast）；</li>
+     *   <li>否则：走 {@link #showLongAnswer}（BigTextStyle 通知）。</li>
+     * </ul>
+     * <p>am broadcast Toast 内部有降级逻辑 —— 失败会自动转通知。
+     */
     private void presentAnswer(@NonNull String answer) {
-        String trimmed = answer.trim();
-        // v4 修复：所有答案统一走 Notification，废弃 am broadcast Toast（ColorOS 14+ 会立刻 Toast already killed）
-        showLongAnswer(trimmed);
-        // 短答案额外在 logcat 输出一份，便于自动化测试 / 排查
+        final String trimmed = answer == null ? "" : answer.trim();
+        // 不管长短都先在 logcat + debug log 落盘一份，便于自动化 / 排查
         Log.i(TAG, "AI ANSWER: " + trimmed);
+        debugLog("answer", "[" + trimmed.length() + " chars] " + trimmed);
+
+        if (trimmed.isEmpty()) {
+            // 空内容：避免发一条空 Toast 触发奇怪行为，直接走通知
+            showLongAnswer("(空响应)");
+            return;
+        }
+
+        if (trimmed.length() <= SHORT_ANSWER_THRESHOLD) {
+            showShortAnswer(trimmed);
+        } else {
+            showLongAnswer(trimmed);
+        }
     }
 
+    /**
+     * 短答案：系统广播 Toast，失败降级为通知。
+     * <p>为什么要切到 ioHandler：am broadcast 走 su，是 IO。
+     * 为什么要切回主线程：通知必须主线程。
+     */
+    private void showShortAnswer(@NonNull String text) {
+        // 文本前加 "AI提示: "，方便用户一眼看出来源
+        final String toastText = "AI提示: " + text;
+        debugLog("toast", "am broadcast Toast: " + toastText);
+
+        // 先在主线程尝试一次 Toast 兜底：万一广播没生效，至少应用层有显示
+        // （短答案在主线程直接 Toast 是允许的，因为 Toast.makeText 会切到 Toast 内部线程）
+        final Runnable fallbackToNotification = () -> {
+            Log.w(TAG, "am broadcast Toast unavailable, fallback to Notification");
+            debugLog("toast", "am broadcast failed, fallback to Notification");
+            showLongAnswer(text);
+        };
+
+        ioHandler.post(() -> {
+            try {
+                RootCmdExecutor.get().systemToastAsync(toastText, r -> {
+                    // am broadcast 回调也在 IO 线程上 —— 切回主线程
+                    mainHandler.post(() -> {
+                        try {
+                            if (r != null && r.success) {
+                                Log.i(TAG, "am broadcast Toast ok, exit=" + r.exitCode);
+                            } else {
+                                Log.w(TAG, "am broadcast Toast failed: " + r);
+                                fallbackToNotification.run();
+                            }
+                        } catch (Throwable t) {
+                            Log.e(TAG, "systemToast callback crashed", t);
+                            fallbackToNotification.run();
+                        }
+                    });
+                });
+            } catch (Throwable t) {
+                Log.e(TAG, "systemToastAsync dispatch failed", t);
+                mainHandler.post(fallbackToNotification);
+            }
+        });
+    }
+
+    /**
+     * 长答案：BigTextStyle 通知。必须在主线程调用。
+     */
     private void showLongAnswer(@NonNull String text) {
-        ensureNotificationChannel(this);
-        NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-        if (nm == null) return;
-
-        Intent contentIntent = getPackageManager().getLaunchIntentForPackage(getPackageName());
-        int piFlags = PendingIntent.FLAG_UPDATE_CURRENT;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            piFlags |= PendingIntent.FLAG_IMMUTABLE;
+        // 不论被谁调用，最终都切到主线程做 UI（避免某些路径下被 ioHandler 直接调）
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post(() -> showLongAnswer(text));
+            return;
         }
-        PendingIntent pi = contentIntent != null
-                ? PendingIntent.getActivity(this, 0, contentIntent, piFlags)
-                : null;
-
-        Notification.Builder builder;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            builder = new Notification.Builder(this, CHANNEL_ID)
-                    .setSmallIcon(android.R.drawable.ic_dialog_info)
-                    .setContentTitle("AI 答案")
-                    .setContentText(previewForNotification(text))
-                    .setStyle(new Notification.BigTextStyle().bigText(text))
-                    .setAutoCancel(true)
-                    .setWhen(System.currentTimeMillis());
-        } else {
-            builder = new Notification.Builder(this)
-                    .setSmallIcon(android.R.drawable.ic_dialog_info)
-                    .setContentTitle("AI 答案")
-                    .setContentText(previewForNotification(text))
-                    .setAutoCancel(true)
-                    .setWhen(System.currentTimeMillis());
-        }
-        if (pi != null) builder.setContentIntent(pi);
-
         try {
-            nm.notify(NOTIF_ID_RESULT, builder.build());
+            ensureNotificationChannel(this);
+            NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm == null) {
+                Log.w(TAG, "NotificationManager is null");
+                return;
+            }
+
+            Intent contentIntent = getPackageManager().getLaunchIntentForPackage(getPackageName());
+            int piFlags = PendingIntent.FLAG_UPDATE_CURRENT;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                piFlags |= PendingIntent.FLAG_IMMUTABLE;
+            }
+            PendingIntent pi = contentIntent != null
+                    ? PendingIntent.getActivity(this, 0, contentIntent, piFlags)
+                    : null;
+
+            Notification.Builder builder;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                builder = new Notification.Builder(this, CHANNEL_ID)
+                        .setSmallIcon(android.R.drawable.ic_dialog_info)
+                        .setContentTitle("AI 答案")
+                        .setContentText(previewForNotification(text))
+                        .setStyle(new Notification.BigTextStyle().bigText(text))
+                        .setAutoCancel(true)
+                        .setWhen(System.currentTimeMillis());
+            } else {
+                builder = new Notification.Builder(this)
+                        .setSmallIcon(android.R.drawable.ic_dialog_info)
+                        .setContentTitle("AI 答案")
+                        .setContentText(previewForNotification(text))
+                        .setAutoCancel(true)
+                        .setWhen(System.currentTimeMillis());
+            }
+            if (pi != null) builder.setContentIntent(pi);
+
+            try {
+                nm.notify(NOTIF_ID_RESULT, builder.build());
+            } catch (Throwable t) {
+                Log.w(TAG, "notify failed", t);
+            }
         } catch (Throwable t) {
-            Log.w(TAG, "notify failed", t);
+            // 任何异常都不能杀线程
+            Log.e(TAG, "showLongAnswer crashed", t);
         }
     }
 
@@ -608,7 +687,6 @@ public class BackgroundAssistService extends Service {
     }
 
     private static String safePid(@NonNull Process p) {
-        // Android java.lang.Process 没有 pid()，用反射拿
         try {
             java.lang.reflect.Method m = Process.class.getMethod("pid");
             Object pid = m.invoke(p);
