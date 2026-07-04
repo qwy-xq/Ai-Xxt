@@ -1,0 +1,50 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Android Studio 临时/缓存
+/.idea/
+**/.idea/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# Keystore & secrets —— 任何本地签名/密钥文件都不要进仓库
+*.jks
+*.keystore
+*.p12
+*.pfx
+secrets.properties
+google-services.json
+
+# Gradle wrapper jar 之外的临时文件
+.gradletasknamecache
+
+# OS / 编辑器
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+~$*
+
+# 日志
+*.log
+hs_err_pid*
+
+# Build 产物
+**/build/
+**/app/build/
+**/outputs/
