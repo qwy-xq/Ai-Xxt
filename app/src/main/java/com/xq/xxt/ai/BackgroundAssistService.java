@@ -282,7 +282,7 @@ public class BackgroundAssistService extends Service {
                 Log.w(TAG, "getevent loop crashed: " + t.getClass().getSimpleName()
                         + ": " + t.getMessage());
                 debugLog("ge-err", t.getClass().getSimpleName() + ": " + t.getMessage());
-                debugLog("ge-err-stderr", stderrBuf.toString("UTF-8"));
+                debugLog("ge-err-stderr", stderrBuf.toString(java.nio.charset.StandardCharsets.UTF_8));
             } finally {
                 geteventProcess = null;
                 closeQuietly(reader);
