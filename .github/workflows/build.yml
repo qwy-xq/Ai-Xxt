@@ -21,6 +21,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 — 拉全历史，方便 Gradle 解析 git 状态
+          fetch-depth: 0
 
       - name: Set up JDK 17
         # AGP 9.x 要求 JDK 17+
@@ -68,7 +71,7 @@ jobs:
           name: aixxt-debug-apk
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 7
           # compression-level: 0 — store without compression so the
           # inner APK's local file headers are preserved byte-for-byte.
           # (compressed zip containers were observed to corrupt the
@@ -90,3 +93,18 @@ jobs:
             app/build/reports/**
             **/build/reports/**
           retention-days: 7
+
+      # 这一步必须在最后，无论 build 成功还是失败都执行（if: always()）。
+      # 目的是让主理人能用 gh API / REST API 直接 grep 到本轮 run 的最终结论。
+      - name: Emit BUILD_RESULT marker
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "BUILD_RESULT=success"
+          elif [ "${{ job.status }}" = "cancelled" ]; then
+            echo "BUILD_RESULT=cancelled"
+          else
+            echo "BUILD_RESULT=failure"
+          fi
+          echo "BUILD_RUN_ID=${{ github.run_id }}"
+          echo "BUILD_RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
