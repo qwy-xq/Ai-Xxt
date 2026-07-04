@@ -110,6 +110,26 @@ public class BackgroundAssistService extends Service {
     private BroadcastReceiver externalReceiver;
 
     // ------------------------------------------------------------
+    // 调试日志 —— 写到 App 私有 cache 目录，绕过 logcat buffer 滚动
+    // ------------------------------------------------------------
+
+    private static final java.io.File DEBUG_LOG_FILE =
+            new java.io.File("/data/data/com.xq.xxt.ai/cache/aixxt-debug.log");
+
+    private static synchronized void debugLog(@NonNull String tag, @NonNull String msg) {
+        try {
+            String line = "[" + new java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US)
+                    .format(new java.util.Date()) + "] [" + tag + "] " + msg + "\n";
+            try (java.io.FileWriter fw = new java.io.FileWriter(DEBUG_LOG_FILE, true);
+                 java.io.BufferedWriter bw = new java.io.BufferedWriter(fw)) {
+                bw.write(line);
+            }
+        } catch (Throwable ignored) {
+            // 调试日志写失败不能影响主流程
+        }
+    }
+
+    // ------------------------------------------------------------
     // Service 生命周期
     // ------------------------------------------------------------
 
@@ -144,6 +164,7 @@ public class BackgroundAssistService extends Service {
         }
 
         // 启动 /dev/input 监听线程
+        debugLog("onCreate", "service started, scheduling input listener");
         startInputListener();
     }
 
@@ -195,6 +216,7 @@ public class BackgroundAssistService extends Service {
         inputListenerAlive.set(true);
         new Thread(this::inputListenerLoop, "input-listener").start();
         Log.i(TAG, "input listener thread started");
+        debugLog("listener", "thread spawned, getevent will start in loop");
     }
 
     private void stopInputListener() {
@@ -220,7 +242,9 @@ public class BackgroundAssistService extends Service {
             Process process = null;
             BufferedReader reader = null;
             Thread stderrDrainThread = null;
+            java.io.ByteArrayOutputStream stderrBuf = new java.io.ByteArrayOutputStream();
             try {
+                debugLog("ge", "spawning: su -c getevent -q 2>&1");
                 Log.i(TAG, "spawning: su -c getevent -q");
 
                 // 注意：使用数组形式（不会经过 /system/bin/sh -c 的二次解析）
@@ -228,23 +252,34 @@ public class BackgroundAssistService extends Service {
                 process = Runtime.getRuntime().exec(new String[]{
                         "su",
                         "-c",
-                        "getevent -q 2>/dev/null"
+                        "getevent -q 2>&1"
                 });
                 geteventProcess = process;
+                debugLog("ge", "spawned pid=" + (process != null ? safePid(process) : "null"));
 
                 // 单独起一个线程把 stderr 抽干，防止管道缓冲区满卡住 getevent。
-                stderrDrainThread = drainStreamAsync(process.getErrorStream(), "stderr");
+                // 同时把内容写到 stderrBuf，结束后 dump 到 debug log 方便诊断。
+                stderrDrainThread = drainStreamAsync(process.getErrorStream(), "stderr", stderrBuf);
 
                 InputStream stdout = process.getInputStream();
                 reader = new BufferedReader(new InputStreamReader(stdout, StandardCharsets.UTF_8));
 
                 String line;
+                int lineCount = 0;
                 while (inputListenerAlive.get() && (line = reader.readLine()) != null) {
+                    lineCount++;
+                    if (lineCount <= 3 || lineCount % 50 == 0) {
+                        debugLog("ge-line", "[" + lineCount + "] " + line);
+                    }
                     handleGeteventLine(line);
                 }
+                int exit = process.isAlive() ? -1 : process.exitValue();
+                debugLog("ge", "stdout EOF after " + lineCount + " lines, exit=" + exit);
             } catch (Throwable t) {
                 Log.w(TAG, "getevent loop crashed: " + t.getClass().getSimpleName()
                         + ": " + t.getMessage());
+                debugLog("ge-err", t.getClass().getSimpleName() + ": " + t.getMessage());
+                debugLog("ge-err-stderr", stderrBuf.toString("UTF-8"));
             } finally {
                 geteventProcess = null;
                 closeQuietly(reader);
@@ -279,13 +314,15 @@ public class BackgroundAssistService extends Service {
      * 后台抽干一个 InputStream（典型场景：getevent 的 stderr），避免缓冲区满阻塞子进程。
      */
     @NonNull
-    private static Thread drainStreamAsync(@NonNull InputStream in, @NonNull String tag) {
+    private static Thread drainStreamAsync(@NonNull InputStream in, @NonNull String tag,
+                                          @Nullable java.io.ByteArrayOutputStream sink) {
         Thread t = new Thread(() -> {
             byte[] buf = new byte[512];
             try {
                 int n;
                 while (!Thread.currentThread().isInterrupted()
                         && (n = in.read(buf)) > 0) {
+                    if (sink != null) sink.write(buf, 0, n);
                     // 选择性记录：getevent 偶尔会向 stderr 喷 warning，不影响主逻辑
                     if (Log.isLoggable(TAG, Log.DEBUG)) {
                         Log.d(TAG, "[" + tag + "] " + new String(buf, 0, n, StandardCharsets.UTF_8).trim());
@@ -350,6 +387,7 @@ public class BackgroundAssistService extends Service {
 
         if (volDownStreak >= 2) {
             volDownStreak = 0;
+            debugLog("trigger", "double-tap detected, triggering pipeline");
             triggerPipeline("getevent_voldown_x2");
         }
     }
@@ -564,6 +602,14 @@ public class BackgroundAssistService extends Service {
                 c.close();
             } catch (IOException ignored) {
             }
+        }
+    }
+
+    private static String safePid(@NonNull Process p) {
+        try {
+            return String.valueOf(p.pid());
+        } catch (Throwable t) {
+            return "?";
         }
     }
 }
