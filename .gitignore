@@ -53,3 +53,17 @@ hs_err_pid*
 **/build/
 **/app/build/
 **/outputs/
+# === 项目本地备份目录（不进仓库） ===
+/_extract/
+/_pw/
+/_v2/
+/_legacy/
+/_backups/
+/_screenshots/
+/gh-artifacts/
+
+# === Workbuddy 临时文件（不进仓库） ===
+/.workbuddy/
+
+# === .git 全量备份（不进仓库） ===
+/.git.bak.*/
