@@ -608,8 +608,11 @@ public class BackgroundAssistService extends Service {
     }
 
     private static String safePid(@NonNull Process p) {
+        // Android java.lang.Process 没有 pid()，用反射拿
         try {
-            return String.valueOf(p.pid());
+            java.lang.reflect.Method m = Process.class.getMethod("pid");
+            Object pid = m.invoke(p);
+            return String.valueOf(pid);
         } catch (Throwable t) {
             return "?";
         }
