@@ -1,11 +1,13 @@
 package com.xq.xxt.ai;
 
+import android.content.Context;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -13,38 +15,33 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Root 命令执行器
+ * Root 命令执行器 —— 通过 {@code su} 提权执行 Shell 命令。
  * <p>
- * 封装通过 {@code su} 提权执行 Shell 命令的能力。设计上做三件事：
- * 1. 不阻塞调用线程 —— 所有执行都丢到单线程 IO 池里跑；
- * 2. 避免命令注入 —— 接收者 (sink) 与参数分离；
- * 3. 失败可观测 —— 同时返回 stdout/stderr/exitCode，并通过回调上抛。
+ * <b>v2 改动：</b>截图路径从原来的 {@code /data/local/tmp/screencapture.png} 改成
+ * App 私有 cache 目录（{@code /data/data/<pkg>/cache/screenshot.png}），并在
+ * 截图后立即 {@code chmod 666} 让普通 Java 进程也能读取。
  * <p>
- * 用法：
- * <pre>
- *   RootCmdExecutor.get().execAsync("screencap -p /data/local/tmp/x.png", result -> {
- *       if (result.success) ...
- *   });
- * </pre>
+ * 为什么要这样做：{@code /data/local/tmp/} 在 SELinux enforcing 下属于
+ * {@code shell_data_file} 类型，普通应用（{@code untrusted_app} 域）即使有 root
+ * 父进程创建的文件，也可能因为 SELinux 标签不匹配而无法读取。把文件放在 App 自己
+ * 的 {@code /data/data/<pkg>/cache/} 下，SELinux 标签天然是 {@code app_data_file}，
+ * App 自己读没有任何阻碍。
  */
 public final class RootCmdExecutor {
 
     private static final String TAG = "RootCmdExecutor";
 
-    /** 命令最大长度限制，防止误把大段 base64 灌进 shell 历史 */
-    private static final int MAX_CMD_LENGTH = 4096;
-
-    /** 默认命令超时（毫秒）—— 截图 / am broadcast 这种短命令 10s 够用 */
+    private static final int MAX_CMD_LENGTH = 8192;
     private static final long DEFAULT_TIMEOUT_MS = 10_000L;
 
     private static volatile RootCmdExecutor INSTANCE;
 
+    @NonNull
     public static RootCmdExecutor get() {
         if (INSTANCE == null) {
-            synchronized (RootCmdExecutor) {
+            synchronized (RootCmdExecutor.class) {
                 if (INSTANCE == null) {
                     INSTANCE = new RootCmdExecutor();
                 }
@@ -59,29 +56,17 @@ public final class RootCmdExecutor {
         return t;
     });
 
-    private final AtomicBoolean suAvailable = new AtomicBoolean(false);
-    private volatile boolean suChecked = false;
-
     private RootCmdExecutor() {
     }
 
     // ------------------------------------------------------------
-    // 公共 API
+    // 通用 API
     // ------------------------------------------------------------
 
-    /**
-     * 异步执行一条 root 命令。
-     *
-     * @param cmd      要执行的 shell 字符串（会被写入 su 的 stdin）
-     * @param callback 结果回调；允许为 null
-     */
     public void execAsync(@NonNull String cmd, @Nullable Callback callback) {
         execAsync(cmd, DEFAULT_TIMEOUT_MS, callback);
     }
 
-    /**
-     * 异步执行一条 root 命令，自定义超时。
-     */
     public void execAsync(@NonNull String cmd, long timeoutMs, @Nullable Callback callback) {
         if (cmd.length() > MAX_CMD_LENGTH) {
             deliverFailure(callback, "command too long: " + cmd.length());
@@ -99,16 +84,13 @@ public final class RootCmdExecutor {
         });
     }
 
-    /**
-     * 同步执行（用于必须等待结果的场景，例如测试）。会阻塞当前线程。
-     */
+    @NonNull
     public Result execBlocking(@NonNull String cmd, long timeoutMs) {
         long t0 = System.currentTimeMillis();
         Process process = null;
         BufferedReader stdoutReader = null;
         BufferedReader stderrReader = null;
         try {
-            // 0: 表示要 root 权限的 su；某些 ROM 上是 su -c "cmd" 的用法，这里走 stdin 写命令
             process = new ProcessBuilder("su").redirectErrorStream(false).start();
 
             try (OutputStream os = process.getOutputStream()) {
@@ -135,12 +117,10 @@ public final class RootCmdExecutor {
             boolean finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS);
             if (!finished) {
                 process.destroyForcibly();
-                return Result.fail("timeout after " + timeoutMs + "ms", out.toString(), err.toString(),
-                        System.currentTimeMillis() - t0);
+                return Result.fail("timeout after " + timeoutMs + "ms",
+                        out.toString(), err.toString(), System.currentTimeMillis() - t0);
             }
             int exit = process.exitValue();
-            suChecked = true;
-            suAvailable.set(exit == 0);
             return new Result(exit == 0, exit, out.toString(), err.toString(),
                     System.currentTimeMillis() - t0);
         } catch (IOException | InterruptedException e) {
@@ -159,48 +139,99 @@ public final class RootCmdExecutor {
     }
 
     // ------------------------------------------------------------
-    // 业务便捷方法 —— 把 "截屏"、"系统 Toast" 这类高频操作封装成一行
+    // 业务便捷方法
     // ------------------------------------------------------------
 
     /**
-     * 执行系统级静默截图。输出固定落到 /data/local/tmp/screencapture.png。
-     * 这是 Android 14+ 一加 Pad Pro 上 Magisk/内核 su 提权后最稳的截图路径。
+     * 截图到指定路径（任意路径，由调用方决定）。
+     * <p>
+     * 注意：本方法不附加 {@code chmod}，如果路径不是 App 私有目录，
+     * 需要调用方自己处理读取权限。
+     *
+     * @param targetPath 绝对路径，例如 {@code /sdcard/Pictures/x.png}
      */
-    public void captureScreenAsync(@Nullable Callback callback) {
-        // -p 直接输出 png；目标路径放在 /data/local/tmp 是因为该目录对 shell 用户默认可写
-        execAsync("screencap -p /data/local/tmp/screencapture.png", callback);
+    public void captureScreenToAsync(@NonNull String targetPath, @Nullable Callback callback) {
+        String cmd = "screencap -p " + escape(targetPath);
+        execAsync(cmd, callback);
     }
 
     /**
-     * 发送一个系统级 Toast 广播。
+     * 截图到 App 私有 cache 目录（推荐），并 {@code chmod 666} 让 App 自己能读。
      * <p>
-     * 之所以走 {@code am broadcast} 而不是 {@link android.widget.Toast}，是因为：
-     * 1. Toast 在系统服务进程里渲染，不会创建应用层窗口；
-     * 2. 第三方应用的窗口遍历算法通常只枚举自己进程的 WindowManager，拿不到这个 Toast；
-     * 3. 可以让 Service 在完全无 UI 的状态下展示结果。
-     * <p>
-     * 注意：com.android.server.notification.Toast 这个 action 是 Android 内部 API，
-     * 不同 ROM / Android 版本可能略有差异，调用失败时建议降级到自己的本地 Toast 或者通知栏。
+     * 实际命令：
+     * <pre>
+     *   mkdir -p /data/data/<pkg>/cache
+     *   screencap -p /data/data/<pkg>/cache/screenshot.png
+     *   chmod 666 /data/data/<pkg>/cache/screenshot.png
+     * </pre>
      *
-     * @param text 要展示的文本，长度建议不超过 200 字符（Toast 本身有长度上限）
+     * @param ctx        任意 Context（仅用于拿包名算 cache 路径，引用会被释放）
+     * @param fileName   文件名，例如 {@code "screenshot.png"}
+     * @param callback   结果回调；通过 {@code result.stdout} 拿不到路径，可以从
+     *                   {@link #resolveAppCachePath(Context, String)} 自己取
+     */
+    public void captureScreenToAppCacheAsync(@NonNull Context ctx,
+                                              @NonNull String fileName,
+                                              @Nullable Callback callback) {
+        String cacheDir = ctx.getApplicationContext().getCacheDir().getAbsolutePath();
+        String target = cacheDir + "/" + fileName;
+        // 三步：建目录、截图、放权
+        String cmd = "mkdir -p " + escape(cacheDir)
+                + " && screencap -p " + escape(target)
+                + " && chmod 666 " + escape(target);
+        execAsync(cmd, callback);
+    }
+
+    /**
+     * 计算 App 私有 cache 目录下一个文件的绝对路径。
+     * 纯字符串拼接，不做任何 IO，方便上游在截图前/后引用同一路径。
+     */
+    @NonNull
+    public static String resolveAppCachePath(@NonNull Context ctx, @NonNull String fileName) {
+        return ctx.getApplicationContext().getCacheDir().getAbsolutePath() + "/" + fileName;
+    }
+
+    /**
+     * 发送一个系统级 Toast 广播（绕过应用窗口遍历）。
+     *
+     * @param text 要展示的文本，建议 ≤ 200 字符
      */
     public void systemToastAsync(@NonNull String text, @Nullable Callback callback) {
-        // 用单引号包裹并转义内部单引号，规避 shell 注入
         String escaped = text.replace("'", "'\\''");
         String cmd = "am broadcast -a com.android.server.notification.Toast --es text '" + escaped + "'";
         execAsync(cmd, callback);
     }
 
-    /**
-     * 强制停止自己包名的应用（用于自毁 / 清理）。方便调试。
-     */
     public void forceStopSelfAsync(@NonNull String pkg, @Nullable Callback callback) {
         execAsync("am force-stop " + pkg, callback);
     }
 
+    /**
+     * 删除一个文件（root 权限）。
+     */
+    public void rmAsync(@NonNull String path, @Nullable Callback callback) {
+        execAsync("rm -f " + escape(path), callback);
+    }
+
+    /**
+     * 列出 /dev/input/event* —— 给 Service 用来探测可用输入设备。
+     */
+    public void listInputDevicesAsync(@Nullable Callback callback) {
+        execAsync("ls -1 /dev/input/event* 2>/dev/null || true", callback);
+    }
+
     // ------------------------------------------------------------
-    // 辅助
+    // 工具
     // ------------------------------------------------------------
+
+    /**
+     * shell 安全转义 —— 用单引号包住参数并转义内部单引号。
+     * 适合给路径这种不含单引号的稳定字符串用。
+     */
+    @NonNull
+    public static String escape(@NonNull String arg) {
+        return "'" + arg.replace("'", "'\\''") + "'";
+    }
 
     private static void deliverFailure(@Nullable Callback cb, String reason) {
         if (cb != null) {
@@ -217,13 +248,21 @@ public final class RootCmdExecutor {
         }
     }
 
+    /**
+     * 简单的文件存在检查（不走 su）。仅用于辅助判断。
+     */
+    public static boolean fileExists(@NonNull String path) {
+        return new File(path).exists();
+    }
+
+    // ------------------------------------------------------------
+    // 类型
+    // ------------------------------------------------------------
+
     public interface Callback {
         void onResult(@NonNull Result result);
     }
 
-    /**
-     * 单次命令执行的结果。
-     */
     public static final class Result {
         public final boolean success;
         public final int exitCode;
@@ -240,8 +279,9 @@ public final class RootCmdExecutor {
         }
 
         static Result fail(String reason, String out, String err, long elapsedMs) {
-            // fail 用 exitCode = -1 标识，避免和正常 shell 返回值冲突
-            return new Result(false, -1, out, (err == null ? "" : err) + "\n[RootCmdExecutor] " + reason, elapsedMs);
+            return new Result(false, -1, out,
+                    (err == null ? "" : err) + "\n[RootCmdExecutor] " + reason,
+                    elapsedMs);
         }
 
         @Override

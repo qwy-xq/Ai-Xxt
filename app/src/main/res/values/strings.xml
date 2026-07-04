@@ -1,3 +1,17 @@
 <resources>
     <string name="app_name">Ai Xxt</string>
+
+    <!-- MainActivity -->
+    <string name="app_title">Ai Xxt 配置</string>
+    <string name="app_subtitle">填好下面的信息并启动后台服务。</string>
+
+    <string name="label_api_key">API Key</string>
+    <string name="label_base_url">API 接口地址 (Base URL)</string>
+    <string name="label_model">模型 (可选)</string>
+
+    <string name="btn_save">保存配置</string>
+    <string name="btn_start_service">启动后台服务</string>
+
+    <string name="status_idle">状态：待配置</string>
+    <string name="hint_usage">提示：连按 2 次音量减触发；短答案 Toast 显示，长答案下拉通知栏查看。</string>
 </resources>
