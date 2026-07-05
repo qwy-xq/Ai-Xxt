@@ -9,6 +9,9 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Rect;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -20,10 +23,16 @@ import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import org.xmlpull.v1.XmlPullParser;
+import org.xmlpull.v1.XmlPullParserFactory;
+
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -84,6 +93,36 @@ public class BackgroundAssistService extends Service {
 
     /** 截图文件名（放到 App 私有 cache 目录） */
     private static final String SCREENSHOT_NAME = "screenshot.png";
+
+    /** UI 树导出文件名（与 RootCmdExecutor 中的 UI_DUMP_LOCAL_NAME 保持一致） */
+    private static final String UI_DUMP_NAME = "uidump.xml";
+
+    /** 裁剪 + 缩放后的"题目小图"文件名（喂给 Vision） */
+    private static final String QUESTION_CROP_NAME = "question_crop.jpg";
+
+    /**
+     * 缩放目标最长边（像素）。超过此尺寸的边按等比缩到此值以内。
+     * <p>为什么是 512：MiniMax M3 的视觉 token 上限对单图约 1024 边长就接近临界，
+     * 留 1/2 buffer 更稳；同时 JPEG 质量 85 下大约 80~150KB，远低于网关 Body 限额。</p>
+     */
+    private static final int MAX_EDGE_PX = 512;
+
+    /** JPEG 压缩质量（85 是肉眼无损的下界，性价比最高） */
+    private static final int JPEG_QUALITY = 85;
+
+    /**
+     * 状态栏阈值：Y < 此值的节点视为状态栏元素，剔除出候选。
+     * <p>为什么是 150：大部分全面屏设备状态栏高度 60~110dp（dpi 3x 下 180~330px），
+     * 150 是一个保守的最小公约数，能在不丢掉"题目紧贴状态栏"边缘情况的同时，
+     * 稳健过滤掉通知 / 信号 / 电量 / 时间等状态栏元素。</p>
+     */
+    private static final int STATUS_BAR_PX = 150;
+
+    /**
+     * 底部导航栏占比：Y > 屏幕高度 * (1 - 此值) 的节点视为导航栏，剔除出候选。
+     * <p>0.18 是基于主流全面屏手势条的折中值。{@code 0} 表示不做底部过滤。</p>
+     */
+    private static final double NAV_BAR_BOTTOM_RATIO = 0.18;
 
     /**
      * getevent raw 协议中要识别的关键 token。
@@ -387,6 +426,21 @@ public class BackgroundAssistService extends Service {
      * 入口：触发一次完整流水线。
      * <p>用 {@link AtomicBoolean#compareAndSet} 保证任何时候只有一个
      * pipeline 在跑，新触发的会被丢弃并 Log.i。</p>
+     *
+     * <h2>v3 流水线（Root 静默 Dump UI 树 → 解析 bounds → Root 截图 → 内存裁剪缩放 → Vision）</h2>
+     * <ol>
+     *   <li>{@link RootCmdExecutor#dumpUiXml(Context)} —— {@code su -c uiautomator dump} 拿
+     *       当前 UI 布局 XML（已拷到 App 私有 cache，权限 OK）；</li>
+     *   <li>{@link RootCmdExecutor#screenshot(Context)} —— 拿全屏无损大图；</li>
+     *   <li>解析 XML 找"题目 / 选项 / 公式"容器的 {@code bounds}，
+     *       转成屏幕矩形（{@link Rect}）；没匹配上就 fallback 到屏幕中段；</li>
+     *   <li>把大图加载到内存（带 {@code inSampleSize} 防 OOM），
+     *       按 bounds 裁剪 + 等比缩放到最长边 {@value #MAX_EDGE_PX}px，
+     *       压成 {@code question_crop.jpg}（质量 {@value #JPEG_QUALITY}）；</li>
+     *   <li>把裁剪小图丢给 {@link AiVisionClient#analyze(File, String, Callback)}，mime 显式
+     *       {@code image/jpeg}；</li>
+     *   <li>成功 → 主线程呈现；失败 → 触发长通知兜底。</li>
+     * </ol>
      */
     private void triggerPipeline(@NonNull String source) {
         if (!busy.compareAndSet(false, true)) {
@@ -395,20 +449,68 @@ public class BackgroundAssistService extends Service {
         }
         ioHandler.post(() -> {
             try {
-                // 1) 截屏 —— RootCmdExecutor.screenshot() 是同步实现（内部守护线程跑 su），
-                //    不阻塞调用方太久
-                java.io.File png = RootCmdExecutor.screenshot(this);
-                if (png == null || !png.exists() || png.length() == 0L) {
+                // 0) 拿屏幕尺寸（任何一步失败都需要做屏幕中段兜底）
+                int screenW = 0, screenH = 0;
+                android.view.WindowManager wm =
+                        (android.view.WindowManager) getSystemService(Context.WINDOW_SERVICE);
+                if (wm != null) {
+                    android.graphics.Point p = new android.graphics.Point();
+                    try {
+                        wm.getDefaultDisplay().getRealSize(p);
+                    } catch (Throwable ignored) {
+                    }
+                    screenW = p.x;
+                    screenH = p.y;
+                }
+                debugLog("pipeline", "screen=" + screenW + "x" + screenH);
+
+                // 1) dump UI 树 —— 静默导出当前布局
+                File uiXml = RootCmdExecutor.dumpUiXml(this);
+                if (uiXml == null || !uiXml.exists() || uiXml.length() == 0L) {
+                    Log.w(TAG, "uiautomator dump failed, fallback to full-screen");
+                    debugLog("pipeline", "uidump missing, will fallback");
+                } else {
+                    debugLog("pipeline", "uidump ready: " + uiXml.getAbsolutePath()
+                            + " (" + uiXml.length() + " bytes)");
+                }
+
+                // 2) Root 截屏 —— 拿无损大图
+                File fullshot = RootCmdExecutor.screenshot(this);
+                if (fullshot == null || !fullshot.exists() || fullshot.length() == 0L) {
                     Log.w(TAG, "screencap failed or file missing/empty");
-                    // 主线程呈现失败通知
                     mainHandler.post(() -> showLongAnswer("截图失败"));
                     return;
                 }
-                debugLog("pipeline", "screenshot ready: " + png.getAbsolutePath()
-                        + " (" + png.length() + " bytes)");
+                debugLog("pipeline", "screenshot ready: " + fullshot.getAbsolutePath()
+                        + " (" + fullshot.length() + " bytes)");
 
-                // 2) 调 Vision（一次性 Callback，不复用旧 ResultCallback）
-                AiVisionClient.get().analyze(png, new AiVisionClient.Callback() {
+                // 3) 解析 bounds —— 默认屏幕中段兜底
+                Rect questionRect = fallbackCenterRect(screenW, screenH);
+                if (uiXml != null && uiXml.exists() && uiXml.length() > 0L && screenW > 0) {
+                    Rect parsed = UiTreeParser.findQuestionRect(uiXml, screenW, screenH);
+                    if (parsed != null) {
+                        questionRect = parsed;
+                        debugLog("pipeline", "parsed question rect = " + questionRect.toShortString());
+                    } else {
+                        debugLog("pipeline", "no question rect parsed, using center fallback");
+                    }
+                }
+
+                // 4) 裁剪 + 缩放 + JPEG
+                File cropped;
+                try {
+                    cropped = cropAndDownscale(fullshot, questionRect, MAX_EDGE_PX,
+                            new File(getCacheDir(), QUESTION_CROP_NAME));
+                } catch (Throwable cropFail) {
+                    Log.e(TAG, "crop/downscale failed, will feed full shot", cropFail);
+                    debugLog("pipeline", "crop failed: " + cropFail.getMessage());
+                    cropped = fullshot; // 兜底：把整图直接喂给 Vision，至少不阻塞流水线
+                }
+                debugLog("pipeline", "cropped file: " + cropped.getAbsolutePath()
+                        + " (" + cropped.length() + " bytes)");
+
+                // 5) 调 Vision —— mime 显式 image/jpeg，OkHttp 回调在子线程
+                AiVisionClient.get().analyze(cropped, "image/jpeg", new AiVisionClient.Callback() {
                     @Override
                     public void onSuccess(@NonNull String answer) {
                         // OkHttp 回调在子线程 —— 切回主线程呈现
@@ -430,6 +532,149 @@ public class BackgroundAssistService extends Service {
                 busy.set(false);
             }
         });
+    }
+
+    /**
+     * 当 UI 树解析失败 / 不存在 / 屏幕尺寸拿不到时的兜底矩形：
+     * 屏幕中段（去掉顶部 {@value #STATUS_BAR_PX}px 和底部 {@value #NAV_BAR_BOTTOM_RATIO} 比例）。
+     */
+    @NonNull
+    private static Rect fallbackCenterRect(int screenW, int screenH) {
+        if (screenW <= 0 || screenH <= 0) {
+            // 极端情况：返回空 Rect，后续会按原图比例走
+            return new Rect(0, 0, 0, 0);
+        }
+        int top = STATUS_BAR_PX;
+        int bottom = (int) (screenH * (1.0 - NAV_BAR_BOTTOM_RATIO));
+        if (bottom <= top + 32) {
+            bottom = screenH; // 屏幕太小，兜底用整屏
+        }
+        return new Rect(0, top, screenW, bottom);
+    }
+
+    /**
+     * 把全屏截图按 {@code rect} 裁剪，再等比缩放到最长边 ≤ {@code maxEdgePx}，
+     * 压成 JPEG 写到 {@code out}。失败抛异常，由 {@link #triggerPipeline} 走兜底。
+     *
+     * <p><b>防 OOM 关键：</b>先用 {@link BitmapFactory.Options#inJustDecodeBounds}
+     * 探到原图尺寸，再选 {@link BitmapFactory.Options#inSampleSize} 让第一次 decode
+     * 出来的"草稿图"长边 ≈ maxEdgePx*2，避免直接把 8K 屏拍立得一次性吃进堆里。</p>
+     */
+    @NonNull
+    private static File cropAndDownscale(@NonNull File srcPng,
+                                          @NonNull Rect rect,
+                                          int maxEdgePx,
+                                          @NonNull File outJpeg) throws IOException {
+        // 1) 探尺寸
+        BitmapFactory.Options probe = new BitmapFactory.Options();
+        probe.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(srcPng.getAbsolutePath(), probe);
+        int srcW = probe.outWidth;
+        int srcH = probe.outHeight;
+        if (srcW <= 0 || srcH <= 0) {
+            throw new IOException("decodeFile probe failed: " + srcPng.getAbsolutePath());
+        }
+
+        // 2) 把用户给的 rect 夹到 [0, srcW) x [0, srcH)
+        Rect safe = clampRect(rect, srcW, srcH);
+
+        // 3) 第一次 decode —— 带 inSampleSize，让"草稿图"长边 ≈ maxEdgePx * 2
+        BitmapFactory.Options decode = new BitmapFactory.Options();
+        decode.inSampleSize = computeInSampleSize(safe.width(), safe.height(), maxEdgePx * 2);
+        decode.inPreferredConfig = Bitmap.Config.ARGB_8888;
+        Bitmap draft = BitmapFactory.decodeFile(srcPng.getAbsolutePath(), decode);
+        if (draft == null) {
+            throw new IOException("decodeFile returned null for " + srcPng.getAbsolutePath());
+        }
+
+        // 4) 草稿图是 src 的 1/sampleSize 倍；把 safe 按比例换算到 draft 坐标系
+        float ratio = (float) decode.inSampleSize;
+        int dx = (int) Math.floor(safe.left / ratio);
+        int dy = (int) Math.floor(safe.top / ratio);
+        int dw = (int) Math.ceil(safe.width() / ratio);
+        int dh = (int) Math.ceil(safe.height() / ratio);
+        // 再次夹到 draft 边界
+        if (dx < 0) { dw += dx; dx = 0; }
+        if (dy < 0) { dh += dy; dy = 0; }
+        if (dx + dw > draft.getWidth()) dw = draft.getWidth() - dx;
+        if (dy + dh > draft.getHeight()) dh = draft.getHeight() - dy;
+        if (dw <= 0 || dh <= 0) {
+            draft.recycle();
+            throw new IOException("crop region empty after ratio scale: "
+                    + safe.toShortString() + " src=" + srcW + "x" + srcH);
+        }
+        Bitmap cropped = Bitmap.createBitmap(draft, dx, dy, dw, dh);
+        if (cropped != draft) {
+            draft.recycle();
+        }
+
+        // 5) 等比缩放：最长边 = maxEdgePx
+        Bitmap scaled = scaleMaxEdge(cropped, maxEdgePx);
+        if (scaled != cropped) {
+            cropped.recycle();
+        }
+
+        // 6) JPEG 写出（compress 失败抛 IOException）
+        File parent = outJpeg.getParentFile();
+        if (parent != null && !parent.exists()) {
+            //noinspection ResultOfMethodCallIgnored
+            parent.mkdirs();
+        }
+        try (FileOutputStream fos = new FileOutputStream(outJpeg)) {
+            boolean ok = scaled.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, fos);
+            fos.flush();
+            if (!ok) {
+                throw new IOException("Bitmap.compress(JPEG) returned false");
+            }
+        } finally {
+            if (scaled != null && !scaled.isRecycled()) {
+                scaled.recycle();
+            }
+        }
+        return outJpeg;
+    }
+
+    @NonNull
+    private static Rect clampRect(@NonNull Rect r, int maxW, int maxH) {
+        int left = Math.max(0, r.left);
+        int top = Math.max(0, r.top);
+        int right = Math.min(maxW, r.right);
+        int bottom = Math.min(maxH, r.bottom);
+        if (right <= left) right = Math.min(maxW, left + 1);
+        if (bottom <= top) bottom = Math.min(maxH, top + 1);
+        return new Rect(left, top, right, bottom);
+    }
+
+    /**
+     * 计算 {@code inSampleSize} —— 让 decode 出来的草稿图长边不超过 targetEdge，
+     * 且 sampleSize 必须是 2 的幂（BitmapFactory 强制）。
+     */
+    private static int computeInSampleSize(int regionW, int regionH, int targetEdge) {
+        int longEdge = Math.max(regionW, regionH);
+        if (longEdge <= 0) return 1;
+        int sample = 1;
+        while ((longEdge / (sample * 2)) >= targetEdge) {
+            sample *= 2;
+            if (sample >= 32) break; // 32 是经验上限，再大就糊
+        }
+        return Math.max(1, sample);
+    }
+
+    /**
+     * 等比缩放：让较长边等于 {@code maxEdge}，短边按比例缩。
+     * 如果原图最长边已经 ≤ maxEdge，直接返回原图。
+     */
+    @NonNull
+    private static Bitmap scaleMaxEdge(@NonNull Bitmap src, int maxEdge) {
+        int w = src.getWidth();
+        int h = src.getHeight();
+        int longEdge = Math.max(w, h);
+        if (longEdge <= maxEdge) return src;
+        float ratio = (float) maxEdge / (float) longEdge;
+        int nw = Math.max(1, Math.round(w * ratio));
+        int nh = Math.max(1, Math.round(h * ratio));
+        Bitmap b = Bitmap.createScaledBitmap(src, nw, nh, true);
+        return b != null ? b : src;
     }
 
     /**
@@ -631,6 +876,224 @@ public class BackgroundAssistService extends Service {
             return String.valueOf(pid);
         } catch (Throwable t) {
             return "?";
+        }
+    }
+
+    // ============================================================
+    // UI 树解析器（v3：XmlPullParser 容错版）
+    // ============================================================
+
+    /**
+     * 轻量级 UI 树解析器：从 {@code uiautomator dump} 产出的 XML 里挑出最像"题目 / 选项 /
+     * 公式"容器的节点，返回其在屏幕坐标系下的 {@link Rect}。
+     *
+     * <p><b>核心策略：</b></p>
+     * <ol>
+     *   <li>用 {@link XmlPullParser} 流式遍历，<b>只</b>看 {@code <node>} 的属性；</li>
+     *   <li>过滤掉 {@code Y < STATUS_BAR_PX} 与
+     *       {@code Y > screenH * (1 - NAV_BAR_BOTTOM_RATIO)} 的节点；</li>
+     *   <li>对每个节点打分：WebView +100，含"题/题号/question/stem/题目/选项/option/answer"
+     *       关键字 +60，面积越大越好（避免选到小卡片）；</li>
+     *   <li>取分最高的节点；若全 0 分，返回 null（让 Service 走屏幕中段兜底）。</li>
+     * </ol>
+     *
+     * <p><b>容错要点：</b></p>
+     * <ul>
+     *   <li>任何字段缺失 / 类型不匹配 / XML 非法都安全 return null，不抛；</li>
+     *   <li>不依赖具体 ROM 的私有类名（不写"com.chaoxing.mobile"这种白名单，
+     *       改用关键字 / WebView 兜底，跨刷题 App 通用）；</li>
+     *   <li>{@code bounds} 严格按 {@code [left,top][right,bottom]} 解析，长度不匹配直接跳过。</li>
+     * </ul>
+     */
+    static final class UiTreeParser {
+
+        /** 关键字列表（命中任一即加分）。统一小写比较。 */
+        private static final String[] QUESTION_KEYWORDS = {
+                "题目", "题号", "题干", "试题", "选项", "解答", "答案",
+                "question", "stem", "option", "answer", "exercise", "problem"
+        };
+
+        private UiTreeParser() {
+        }
+
+        /**
+         * 主入口：解析 uidump.xml，挑出最佳题目矩形。
+         *
+         * @param xml      uiautomator dump 文件
+         * @param screenW  屏幕宽（px）
+         * @param screenH  屏幕高（px）
+         * @return 最佳节点矩形；找不到返回 null
+         */
+        @Nullable
+        static Rect findQuestionRect(@NonNull File xml, int screenW, int screenH) {
+            if (screenW <= 0 || screenH <= 0) return null;
+            // 把整个 XML 读成 String —— uidump 通常 100~500KB，一次性读够，
+            // 用 StringReader + XmlPullParser 比 InputStream 更方便设 encoding。
+            String content = readFileSafe(xml);
+            if (content == null || content.isEmpty()) return null;
+
+            int navTopY = (int) (screenH * (1.0 - NAV_BAR_BOTTOM_RATIO));
+            if (navTopY <= STATUS_BAR_PX + 32) {
+                navTopY = screenH; // 屏幕太矮，关闭底部过滤
+            }
+
+            int bestScore = 0;
+            Rect bestRect = null;
+
+            XmlPullParser parser = null;
+            try {
+                XmlPullParserFactory factory = XmlPullParserFactory.newInstance();
+                factory.setNamespaceAware(false);
+                parser = factory.newPullParser();
+                parser.setInput(new StringReader(content));
+
+                int event = parser.getEventType();
+                while (event != XmlPullParser.END_DOCUMENT) {
+                    if (event == XmlPullParser.START_TAG && "node".equals(parser.getName())) {
+                        Rect r = null;
+                        int score = 0;
+                        try {
+                            r = parseBounds(parser.getAttributeValue(null, "bounds"));
+                            String cls = safeLower(parser.getAttributeValue(null, "class"));
+                            String text = safeLower(parser.getAttributeValue(null, "text"));
+                            String desc = safeLower(parser.getAttributeValue(null, "content-desc"));
+                            String rid = safeLower(parser.getAttributeValue(null, "resource-id"));
+                            String pkg = safeLower(parser.getAttributeValue(null, "package"));
+                            int childCount = safeInt(parser.getAttributeValue(null, "childCount"));
+
+                            if (r == null) {
+                                // 节点没有 bounds，直接跳过
+                            } else if (r.width() <= 16 || r.height() <= 16) {
+                                // 太小（图标、按钮、装饰条）—— 跳过
+                            } else if (r.top < STATUS_BAR_PX) {
+                                // 顶部状态栏区域
+                            } else if (r.bottom > navTopY) {
+                                // 底部导航栏 / 手势条
+                            } else {
+                                // ===== 计分 =====
+                                // WebView 加分（刷题 App 大量内容都在 WebView 里）
+                                if (cls.contains("webview")) score += 100;
+                                // ScrollView / RecyclerView 通常是大容器
+                                if (cls.contains("scrollview")) score += 30;
+                                if (cls.contains("recyclerview")) score += 20;
+                                if (cls.contains("listview")) score += 15;
+                                // 关键字匹配（text / desc / resource-id 都查）
+                                String haystack = text + " " + desc + " " + rid;
+                                for (String kw : QUESTION_KEYWORDS) {
+                                    if (haystack.contains(kw)) {
+                                        score += 60;
+                                        break; // 多个关键字只算一次，避免被刷分
+                                    }
+                                }
+                                // 子节点越多越像容器（题目的"选项 ABCD"会有多个子 TextView）
+                                if (childCount >= 3) score += 10;
+                                if (childCount >= 6) score += 10;
+                                // 面积加分（避免选到小卡片）
+                                long area = (long) r.width() * (long) r.height();
+                                if (area > 1_000_000L) score += 20;
+                                if (area > 500_000L) score += 10;
+                                // 系统自带的状态栏 / 导航栏应用减分
+                                if (pkg.contains("systemui")) score -= 200;
+                                if (pkg.contains("launcher")) score -= 200;
+                                if (pkg.contains("inputmethod")) score -= 100;
+                                // 题目不应该横跨整个屏幕（一般是内容区）—— 适度扣分
+                                if (r.width() >= screenW && r.height() >= screenH) score -= 30;
+                            }
+                        } catch (Throwable attrErr) {
+                            // 单个节点属性解析失败不影响整体 —— 继续
+                            r = null;
+                            score = 0;
+                        }
+                        if (r != null && score > bestScore) {
+                            bestScore = score;
+                            bestRect = r;
+                        }
+                    }
+                    event = parser.next();
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "UiTreeParser failed: " + t.getClass().getSimpleName()
+                        + ": " + t.getMessage());
+                return null;
+            } finally {
+                if (parser != null) {
+                    try {
+                        parser.setInput(null);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+            // 兜底：所有节点都是 0 分（比如只有空 layout），返回 null 让 Service 走屏幕中段
+            return bestScore > 0 ? bestRect : null;
+        }
+
+        /**
+         * 解析 uiautomator 的 {@code bounds} 属性。格式：{@code [left,top][right,bottom]}。
+         * 任何意外情况返回 null。
+         */
+        @Nullable
+        private static Rect parseBounds(@Nullable String raw) {
+            if (raw == null || raw.isEmpty()) return null;
+            int open1 = raw.indexOf('[');
+            int close1 = raw.indexOf(']');
+            int open2 = raw.indexOf('[', close1 > 0 ? close1 : 0);
+            int close2 = raw.indexOf(']', open2 > 0 ? open2 : 0);
+            if (open1 < 0 || close1 < 0 || open2 < 0 || close2 < 0) return null;
+            String leftTop = raw.substring(open1 + 1, close1);
+            String rightBottom = raw.substring(open2 + 1, close2);
+            int comma1 = leftTop.indexOf(',');
+            int comma2 = rightBottom.indexOf(',');
+            if (comma1 < 0 || comma2 < 0) return null;
+            try {
+                int l = Integer.parseInt(leftTop.substring(0, comma1).trim());
+                int t = Integer.parseInt(leftTop.substring(comma1 + 1).trim());
+                int r = Integer.parseInt(rightBottom.substring(0, comma2).trim());
+                int b = Integer.parseInt(rightBottom.substring(comma2 + 1).trim());
+                return new Rect(l, t, r, b);
+            } catch (NumberFormatException nfe) {
+                return null;
+            } catch (Throwable t) {
+                return null;
+            }
+        }
+
+        @Nullable
+        private static String readFileSafe(@NonNull File f) {
+            // 用最朴素的 InputStreamReader 读全文件 —— 避免 NIO.2 兼容问题
+            java.io.FileInputStream fis = null;
+            java.io.InputStreamReader isr = null;
+            java.io.BufferedReader br = null;
+            try {
+                fis = new java.io.FileInputStream(f);
+                isr = new java.io.InputStreamReader(fis, StandardCharsets.UTF_8);
+                br = new java.io.BufferedReader(isr);
+                StringBuilder sb = new StringBuilder((int) Math.min(f.length(), 1_048_576L));
+                char[] buf = new char[8192];
+                int n;
+                while ((n = br.read(buf)) > 0) sb.append(buf, 0, n);
+                return sb.toString();
+            } catch (Throwable t) {
+                Log.w(TAG, "readFileSafe failed: " + t.getMessage());
+                return null;
+            } finally {
+                closeQuietly(br);
+                closeQuietly(isr);
+                closeQuietly(fis);
+            }
+        }
+
+        @NonNull
+        private static String safeLower(@Nullable String s) {
+            return s == null ? "" : s.toLowerCase(java.util.Locale.ROOT);
+        }
+
+        private static int safeInt(@Nullable String s) {
+            if (s == null || s.isEmpty()) return 0;
+            try {
+                return Integer.parseInt(s);
+            } catch (NumberFormatException nfe) {
+                return 0;
+            }
         }
     }
 }

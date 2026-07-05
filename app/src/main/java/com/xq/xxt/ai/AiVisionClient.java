@@ -149,14 +149,20 @@ public final class AiVisionClient {
      *   });
      * </pre>
      *
+     * <p>本方法会根据 <b>文件后缀</b> 自动推断 MIME：
+     * {@code .jpg / .jpeg → image/jpeg}，{@code .png → image/png}，
+     * 其他 / 缺后缀 → {@code image/jpeg}（v3 流水线里裁剪产物就是 JPEG 临时文件，
+     * 走 jpeg 路径最稳）。data-url 始终用 {@link Base64#NO_WRAP} 编码。</p>
+     *
      * <p>callback 都在后台线程触发，调用方需自行切主线程做 UI。</p>
      *
-     * @param png 本地图片文件（PNG）。<b>不能为空、必须 exists()、可读。</b>
-     * @param cb  结果回调；可以为空。任一异常路径都走 onFailure，绝不抛
+     * @param image 本地图片文件（PNG / JPEG / WebP，BitmapFactory 能解即可）。
+     *              <b>不能为空、必须 exists()、可读。</b>
+     * @param cb    结果回调；可以为空。任一异常路径都走 onFailure，绝不抛
      */
-    public void analyze(@NonNull File png, @Nullable Callback cb) {
-        if (png == null || !png.exists() || !png.isFile()) {
-            invokeFailure(cb, new IOException("screenshot file not found: " + png));
+    public void analyze(@NonNull File image, @Nullable Callback cb) {
+        if (image == null || !image.exists() || !image.isFile()) {
+            invokeFailure(cb, new IOException("image file not found: " + image));
             return;
         }
         // 读盘 + Base64 编码在 background 线程做，IO 完了再走 OkHttp（OkHttp 自己在 dispatcher 线程）
@@ -180,9 +186,10 @@ public final class AiVisionClient {
                     return;
                 }
 
-                // 关键：NO_WRAP 必填
-                String b64 = encodeFileToBase64(png.getAbsolutePath());
-                String body = buildRequestBody(b64, DEFAULT_PROMPT, model);
+                // 关键：NO_WRAP 必填；MIME 按后缀探测
+                String mime = detectMime(image);
+                String b64 = encodeFileToBase64(image.getAbsolutePath());
+                String body = buildRequestBody(b64, DEFAULT_PROMPT, model, mime);
                 doRequest(baseUrl, apiKey, body, cb);
             } catch (Throwable t) {
                 // 任何异常（IO / JSON / NPE）都吞下走 onFailure，不让线程死
@@ -190,6 +197,83 @@ public final class AiVisionClient {
                 invokeFailure(cb, t);
             }
         });
+    }
+
+    /**
+     * <b>主入口（带 MIME 提示）。</b>和 {@link #analyze(File, Callback)} 一样，
+     * 只是允许调用方显式指定 MIME，避免被奇怪的文件后缀坑到。
+     * <p>MIME 推荐值：{@code image/png} / {@code image/jpeg} / {@code image/webp}。
+     * 传 null 或空串则回退到 {@link #detectMime(File)} 探测。</p>
+     */
+    public void analyze(@NonNull File image, @Nullable String mimeHint, @Nullable Callback cb) {
+        if (image == null || !image.exists() || !image.isFile()) {
+            invokeFailure(cb, new IOException("image file not found: " + image));
+            return;
+        }
+        final String mime;
+        if (mimeHint == null || mimeHint.isEmpty()) {
+            mime = detectMime(image);
+        } else {
+            mime = mimeHint.toLowerCase(java.util.Locale.ROOT);
+        }
+        // 复用上面的逻辑：通过 analyze 自身重载
+        final String finalMime = mime;
+        ioExec.execute(() -> {
+            try {
+                String apiKey = effectiveApiKey();
+                String baseUrl = effectiveBaseUrl();
+                String model = effectiveModel();
+
+                if (apiKey.isEmpty()) {
+                    invokeFailure(cb, new IllegalStateException(
+                            "apiKey is empty; please configure it in MainActivity first"));
+                    return;
+                }
+                if (baseUrl.isEmpty()) {
+                    invokeFailure(cb, new IllegalStateException("baseUrl is empty"));
+                    return;
+                }
+                if (model.isEmpty()) {
+                    invokeFailure(cb, new IllegalStateException("model is empty"));
+                    return;
+                }
+
+                String b64 = encodeFileToBase64(image.getAbsolutePath());
+                String body = buildRequestBody(b64, DEFAULT_PROMPT, model, finalMime);
+                doRequest(baseUrl, apiKey, body, cb);
+            } catch (Throwable t) {
+                Log.e(TAG, "analyze failed", t);
+                invokeFailure(cb, t);
+            }
+        });
+    }
+
+    /**
+     * 按文件后缀探测 MIME。命中规则：
+     * <ul>
+     *   <li>*.jpg / *.jpeg → image/jpeg</li>
+     *   <li>*.png         → image/png</li>
+     *   <li>*.webp        → image/webp</li>
+     *   <li>其他 / 缺后缀 → image/jpeg（v3 裁剪产物兜底）</li>
+     * </ul>
+     */
+    @NonNull
+    public static String detectMime(@NonNull File f) {
+        String n = f.getName();
+        int dot = n.lastIndexOf('.');
+        if (dot < 0) return "image/jpeg";
+        String ext = n.substring(dot + 1).toLowerCase(java.util.Locale.ROOT);
+        switch (ext) {
+            case "jpg":
+            case "jpeg":
+                return "image/jpeg";
+            case "png":
+                return "image/png";
+            case "webp":
+                return "image/webp";
+            default:
+                return "image/jpeg";
+        }
     }
 
     /**
@@ -252,7 +336,7 @@ public final class AiVisionClient {
 
     /**
      * 把本地文件编码为 OpenAI image_url 所需的 data url 形式
-     * （{@code data:image/png;base64,xxxx}）。
+     * （{@code data:<mime>;base64,xxxx}）。
      * <p><b>关键：</b>使用 {@link Base64#NO_WRAP}，避免 76 字符换行污染 JSON。</p>
      * <p><b>兼容性：</b>此处<b>不用</b> {@code java.nio.file.Files.readAllBytes} 之类
      * NIO.2 工具方法 —— 它们是 Android API 26 (Oreo) 才引入的，与本项目
@@ -260,12 +344,26 @@ public final class AiVisionClient {
      * {@code NoClassDefFoundError} 整条 Vision 链路直接挂掉。改用
      * {@link FileInputStream} + try-with-resources 手动读完字节数组，
      * 是 Android 1.0 时代就有的稳定 API，所有 API level 都能跑。</p>
+     *
+     * @param path 本地图片文件路径
+     * @param mime data url 中使用的 MIME（如 {@code image/jpeg} / {@code image/png}）；
+     *             传 null/空会回退到 {@code image/jpeg}
+     */
+    @NonNull
+    public static String encodeFileToDataUrl(@NonNull String path, @Nullable String mime)
+            throws IOException {
+        byte[] bytes = readAllBytesCompat(path);
+        String b64 = Base64.encodeToString(bytes, Base64.NO_WRAP);
+        String safeMime = (mime == null || mime.isEmpty()) ? "image/jpeg" : mime;
+        return "data:" + safeMime + ";base64," + b64;
+    }
+
+    /**
+     * 兼容旧调用方：data url 强制用 {@code image/png}。仅在"确认图片是 PNG"时使用。
      */
     @NonNull
     public static String encodeFileToDataUrl(@NonNull String path) throws IOException {
-        byte[] bytes = readAllBytesCompat(path);
-        String b64 = Base64.encodeToString(bytes, Base64.NO_WRAP);
-        return "data:image/png;base64," + b64;
+        return encodeFileToDataUrl(path, "image/png");
     }
 
     /**
@@ -318,24 +416,31 @@ public final class AiVisionClient {
      *       "role": "user",
      *       "content": [
      *         {"type": "text", "text": "&lt;prompt&gt;"},
-     *         {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+     *         {"type": "image_url", "image_url": {"url": "data:&lt;mime&gt;;base64,..."}}
      *       ]
      *     }
      *   ],
      *   "max_tokens": 1024
      * }
      * </pre>
+     *
+     * @param mime MIME 字符串（如 {@code image/jpeg} / {@code image/png}），
+     *             会出现在 {@code data:<mime>;base64,} 里。传入空 / null 时回退为
+     *             {@code image/jpeg}（v3 裁剪产物就是 JPEG，最稳的兜底）。
      */
     @NonNull
     private String buildRequestBody(@NonNull String base64Image,
                                     @NonNull String prompt,
-                                    @NonNull String model) throws JSONException {
+                                    @NonNull String model,
+                                    @Nullable String mime) throws JSONException {
+        String safeMime = (mime == null || mime.isEmpty()) ? "image/jpeg" : mime;
+
         JSONObject textPart = new JSONObject()
                 .put("type", "text")
                 .put("text", prompt);
 
         JSONObject imageUrl = new JSONObject()
-                .put("url", "data:image/png;base64," + base64Image);
+                .put("url", "data:" + safeMime + ";base64," + base64Image);
 
         JSONObject imagePart = new JSONObject()
                 .put("type", "image_url")

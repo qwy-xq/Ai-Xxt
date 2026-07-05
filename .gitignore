@@ -61,6 +61,7 @@ hs_err_pid*
 /_backups/
 /_screenshots/
 /gh-artifacts/
+/gh-artifacts-verify/
 
 # === Workbuddy 临时文件（不进仓库） ===
 /.workbuddy/

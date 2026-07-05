@@ -22,17 +22,21 @@ import java.util.concurrent.TimeUnit;
  * <p><b>本次重写对齐主理人 v2 契约：</b></p>
  * <ul>
  *   <li>{@link #execAsync(String, Callback)} / {@link #sync(String)} / {@link #screenshot(Context)} /
- *       {@link #toast(String)} 全部按主理人指定的命名与签名提供；</li>
+ *       {@link #toast(String)} / {@link #dumpUiXml(Context)} 全部按主理人指定的命名与签名提供；</li>
  *   <li>{@code su} 进程统一通过 {@code Runtime.getRuntime().exec(new String[]{"su", "-c", cmd})}
  *       数组形式启动 —— 避免 {@code /system/bin/sh -c} 的二次解析，路径里的空格、
  *       单/双引号都按"原样"交给 su，su 自己用 sh 解析；</li>
- *   <li>两个静态便捷方法：
+ *   <li>三个静态便捷方法：
  *       <ul>
  *         <li>{@link #screenshot(Context)} —— 内部 {@code su -c "screencap -p ... && chmod 666 ..."}，
  *             写到 App 私有 cache 目录下的 {@code screenshot.png}，返回 {@link File}；</li>
  *         <li>{@link #toast(String)} —— 内部 {@code su -c "am broadcast -a
  *             com.android.server.notification.Toast --es text '...'"}，对 text 做最小化转义
  *             （双引号 / 反斜杠 / 空格），避免破坏 am 命令行；</li>
+ *         <li>{@link #dumpUiXml(Context)} —— 内部 {@code su -c "uiautomator dump
+ *             /data/local/tmp/uidump.xml && cat /data/local/tmp/uidump.xml > <cache>/uidump.xml
+ *             && chmod 666 <cache>/uidump.xml"}，把当前 UI 布局树导到 App 私有 cache 目录
+ *             下的 {@code uidump.xml}，返回 {@link File}。</li>
  *       </ul></li>
  *   <li>异步执行走单线程 {@link ExecutorService}（其实务上 su 命令不频繁；为了"不卡主线程"
  *       的硬性要求，必须异步），同步执行走调用方线程（{@link #sync} 内部会起一个临时
@@ -55,6 +59,12 @@ public final class RootCmdExecutor {
 
     /** 截图文件名（固定） */
     private static final String SCREENSHOT_NAME = "screenshot.png";
+
+    /** uiautomator dump 临时远端路径（/data/local/tmp 属于 shell 用户，普通 App 读不到） */
+    private static final String UI_DUMP_REMOTE = "/data/local/tmp/uidump.xml";
+
+    /** uiautomator dump 本地落地文件名（App 私有 cache 目录） */
+    private static final String UI_DUMP_LOCAL_NAME = "uidump.xml";
 
     private static volatile RootCmdExecutor INSTANCE;
 
@@ -221,6 +231,89 @@ public final class RootCmdExecutor {
         String escaped = text.replace("'", "'\\''");
         String cmd = "am broadcast -a com.android.server.notification.Toast --es text '" + escaped + "'";
         execAsync(cmd, 5_000L, callback);
+    }
+
+    // ============================================================
+    // uiautomator dump（v3：UI 树静默导出）
+    // ============================================================
+
+    /**
+     * 同步导出当前 UI 布局树到 App 私有 cache 目录下的 {@code uidump.xml}。
+     * <p>实际执行：</p>
+     * <pre>
+     *   su -c "uiautomator dump /data/local/tmp/uidump.xml
+     *           && cat /data/local/tmp/uidump.xml > <cache>/uidump.xml
+     *           && chmod 666 <cache>/uidump.xml"
+     * </pre>
+     *
+     * <p><b>为什么两步走：</b>{@code uiautomator dump} 只能写到 shell 用户可写的目录
+     * （一般是 {@code /data/local/tmp/}），这个目录对 App 进程本身是不可读的；
+     * 所以我们让 su 先 dump 到远端临时路径，再用 shell 重定向到 App 的私有 cache 目录
+     * 并 {@code chmod 666}，后续解析器就可以用普通文件 IO 直接读。</p>
+     *
+     * @return 目标 File（路径 = {@code ctx.getCacheDir() + "/uidump.xml"}）；
+     *         即使 su 失败路径也正确，调用方通过 {@link File#exists()} / {@link File#length()}
+     *         判断成功与否。
+     */
+    @NonNull
+    public static File dumpUiXml(@NonNull Context ctx) {
+        return dumpUiXml(ctx, 8_000L);
+    }
+
+    /**
+     * 同步导出 UI 树，带显式超时。
+     */
+    @NonNull
+    public static File dumpUiXml(@NonNull Context ctx, long timeoutMs) {
+        String cacheDir = ctx.getApplicationContext().getCacheDir().getAbsolutePath();
+        File out = new File(cacheDir, UI_DUMP_LOCAL_NAME);
+        String target = out.getAbsolutePath();
+        // 单引号包裹，路径里没有单引号，最安全的转义
+        String escTarget = "'" + target.replace("'", "'\\''") + "'";
+        String escRemote = "'" + UI_DUMP_REMOTE + "'";
+        // 先 dump 到 /data/local/tmp（uiautomator 唯一能写的目录），
+        // 再 cat 重定向 + chmod 到 App 私有 cache
+        String cmd = "uiautomator dump " + escRemote
+                + " && cat " + escRemote + " > " + escTarget
+                + " && chmod 666 " + escTarget;
+        Result r = get().syncInternal(cmd, timeoutMs);
+        if (!r.success) {
+            Log.w(TAG, "dumpUiXml failed: " + r);
+        } else {
+            Log.i(TAG, "dumpUiXml ok, " + (out.exists() ? out.length() : -1) + " bytes");
+        }
+        return out;
+    }
+
+    /**
+     * 异步导出 UI 树 —— 不卡调用方线程，callback 在 {@code root-exec-io} 线程触发。
+     */
+    public void dumpUiXmlAsync(@NonNull Context ctx, @Nullable FileCallback callback) {
+        dumpUiXmlAsync(ctx, 8_000L, callback);
+    }
+
+    /**
+     * 异步导出 UI 树，带显式超时。
+     */
+    public void dumpUiXmlAsync(@NonNull Context ctx, long timeoutMs,
+                               @Nullable FileCallback callback) {
+        String cacheDir = ctx.getApplicationContext().getCacheDir().getAbsolutePath();
+        File out = new File(cacheDir, UI_DUMP_LOCAL_NAME);
+        String target = out.getAbsolutePath();
+        String escTarget = "'" + target.replace("'", "'\\''") + "'";
+        String escRemote = "'" + UI_DUMP_REMOTE + "'";
+        String cmd = "uiautomator dump " + escRemote
+                + " && cat " + escRemote + " > " + escTarget
+                + " && chmod 666 " + escTarget;
+        execAsync(cmd, timeoutMs, r -> {
+            if (callback != null) {
+                try {
+                    callback.onResult(out, r);
+                } catch (Throwable t) {
+                    Log.e(TAG, "dumpUiXmlAsync callback threw", t);
+                }
+            }
+        });
     }
 
     // ============================================================
